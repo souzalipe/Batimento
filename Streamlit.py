@@ -1,4 +1,3 @@
-# app.py
 import io
 import re
 import unicodedata
@@ -6,16 +5,26 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# ========= FUNÇÕES DE SUPORTE (baseadas no seu script atual) =========
+
+
+def so_digitos(s):
+    return re.sub(r'\D', '', str(s or ''))
+
 def normaliza_cnpj(cnpj):
-    cnpj_limpo = re.sub(r"\D", "", str(cnpj))
-    return cnpj_limpo if len(cnpj_limpo) == 14 else None
+    d = so_digitos(cnpj)
+    if len(d) == 14:
+        return d
+    # se vier com menos dígitos, completa com zeros à esquerda
+    if 0 < len(d) < 14:
+        return d.zfill(14)
+    return None
 
 def formatar_cnpj(cnpj):
-    cnpj = normaliza_cnpj(cnpj)
-    if cnpj:
-        return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
-    return None
+    d = normaliza_cnpj(cnpj)
+    if not d or len(d) != 14:
+        return None
+    return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}"
+
 
 def remover_duplicatas_por_cnpj(df, coluna_origem):
     df = df.copy()
@@ -33,6 +42,79 @@ def padronizar_colunas(df):
         return s
     df.columns = [norm(c) for c in df.columns]
     return df
+
+
+def normaliza_texto(s):
+    s = str(s or "")
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("utf-8")
+    return s.strip().upper()
+
+def _norm_header_key(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("utf-8")
+    s = re.sub(r"\s+", " ", s.strip().lower())
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+def _encontrar_coluna_status(df: pd.DataFrame):
+    """
+    Tenta localizar a coluna que representa a 'situação/status' do fundo
+    (ex.: 'Situação', 'Situacao', 'Status', 'Status do Fundo', etc.)
+    Retorna o nome ORIGINAL da coluna ou None se não encontrar.
+    """
+    norm_map = {_norm_header_key(c): c for c in df.columns}
+
+    # 1) Prioridades mais comuns
+    prioridade = [
+        "situacao", "situação", "situacao_do_fundo", "situcao", "status", "status_do_fundo"
+    ]
+    for key in prioridade:
+        if key in norm_map:
+            return norm_map[key]
+
+    # 2) Heurística por palavras-chave
+    candidatos = []
+    for k, original in norm_map.items():
+        score = 0
+        if "situac" in k or "situa" in k: score += 3
+        if "status" in k:                 score += 2
+        if "fundo" in k:                  score += 1
+        if "cnpj" in k:                   score = -1
+        if score > 0:
+            candidatos.append((score, original))
+    if candidatos:
+        candidatos.sort(reverse=True, key=lambda x: x[0])
+        return candidatos[0][1]
+
+    return None
+
+# Conjunto de valores considerados "ativos" após normalização (UPPER + sem acentos)
+VALORES_ATIVOS = {
+    normaliza_texto("Em Funcionamento Normal"),
+    normaliza_texto("Em Funcionamento"),
+    normaliza_texto("Ativo"),
+    normaliza_texto("Ativa"),
+    normaliza_texto("Em Atividade"),
+}
+
+def filtrar_status_ativos(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mantém apenas linhas cuja situação/status esteja na lista 'VALORES_ATIVOS'.
+    Se não encontrar a coluna, retorna o df sem alterações (fail-safe).
+    """
+    if df is None or df.empty:
+        return df
+
+    col = _encontrar_coluna_status(df)
+    if not col:
+        # Coluna de status não encontrada; não filtra para evitar perda de dados
+        return df
+
+    out = df.copy()
+    out["_STATUS_NORM_"] = out[col].map(normaliza_texto)
+    out = out[out["_STATUS_NORM_"].isin(VALORES_ATIVOS)].drop(columns=["_STATUS_NORM_"])
+    return out
+
 
 def carregar_excel(arquivo):
     # 'arquivo' pode ser um UploadedFile (Streamlit) ou caminho
@@ -55,12 +137,100 @@ def filtrar_cadfi(df):
             "BB RJ FUNDO DE INVESTIMENTO MULTIMERCADO|"
             "BB ZEUS MULTIMERCADO FUNDO DE INVESTIMENTO|"
             "BB AQUILES FUNDO DE INVESTIMENTO RENDA FIXA|"
-            "BRASILPREV FIX ESTRATÉGIA 2025 III FIF FIF RENDA FIXA RESPONSABILIDADE LIMITADA",
+            "BRASILPREV FIX ESTRATÉGIA 2025 III FIF FIF RENDA FIXA RESPONSABILIDADE LIMITADA"
+            "BB MASTER RENDA FIXA DEBÊNTURES INCENTIVADAS FIF INVESTIMENTO EM INFRAESTRUTURA RESP LIMITADA"
+            "BB CIN"
+            "BB BNC AÇÕES NOSSA CAIXA NOSSO CLUBE DE INVESTIMENTO",
             case=False, na=False
         ))
     )
     df_filtrado = df.loc[filtro].copy()
     return remover_duplicatas_por_cnpj(df_filtrado, "CNPJ_Fundo")
+
+def comparar_controle_fora_cadfi(cadfi_df, controle_df):
+    """
+    Retorna registros do Controle cujo CNPJ não aparece no CadFi (após padronização/duplicatas).
+    Espera que ambas as tabelas já tenham a coluna 'CNPJ' formatada.
+    """
+    return controle_df[~controle_df["CNPJ"].isin(set(cadfi_df["CNPJ"]))].copy()
+
+import re, unicodedata
+import pandas as pd
+
+def _norm_header_key(s: str) -> str:
+    """
+    Normaliza rótulos de coluna: remove acentos, baixa, troca não-alfanum por '_'.
+    Ex.: 'Denominação Social' -> 'denominacao_social'
+    """
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("utf-8")
+    s = re.sub(r"\s+", " ", s.strip().lower())
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+def _encontrar_coluna_nome(df: pd.DataFrame) -> str:
+    """
+    Tenta localizar a coluna que representa o 'nome do fundo' no Controle,
+    usando uma lista de prioridades + heurística por palavras-chave.
+    Retorna o nome ORIGINAL da coluna (não normalizado), ou None.
+    """
+    # Mapa: chave_normalizada -> coluna_original
+    norm_map = {_norm_header_key(c): c for c in df.columns}
+
+    # 1) Prioridades mais comuns
+    prioridade = [
+        "denominacao_social", "denominacao_do_fundo", "denominacao",
+        "nome_do_fundo", "nome_fundo", "nome",
+        "razao_social", "razao", "descricao"
+    ]
+    for key in prioridade:
+        if key in norm_map:
+            return norm_map[key]
+
+    # 2) Heurística: qualquer coluna com 'denomin' ou 'nome' e (idealmente) 'fundo'
+    candidatos = []
+    for k, original in norm_map.items():
+        score = 0
+        if "denomin" in k: score += 3
+        if "nome" in k:    score += 2
+        if "fundo" in k:   score += 1
+        if "cnpj" in k:    score = -1  # nunca usar CNPJ como nome
+        if score > 0:
+            candidatos.append((score, original))
+    if candidatos:
+        candidatos.sort(reverse=True, key=lambda x: x[0])
+        return candidatos[0][1]
+
+    # 3) Fallback: primeira coluna de texto que não seja 'CNPJ'
+    for c in df.columns:
+        if c != "CNPJ" and df[c].dtype == object:
+            return c
+    return None
+
+def relatorio_controle_fora_cadfi(df_controle: pd.DataFrame) -> pd.DataFrame:
+    """
+    Monta DataFrame pronto para exportar com base no Controle que NÃO está no CadFi.
+    Inclui 'CNPJ' e 'Nome do fundo (Controle)', detectando a melhor coluna de nome.
+    """
+    if df_controle is None or df_controle.empty:
+        return pd.DataFrame(columns=["CNPJ", "Nome do fundo (Controle)"])
+
+    out = df_controle.copy()
+    col_nome = _encontrar_coluna_nome(out)
+
+    if col_nome and col_nome in out.columns:
+        out = out.rename(columns={col_nome: "Nome do fundo (Controle)"})
+        out["Nome do fundo (Controle)"] = (
+            out["Nome do fundo (Controle)"]
+            .astype(str)
+            .str.strip()
+        )
+    else:
+        # não encontrou, exporta coluna vazia (mas mantém estrutura)
+        out["Nome do fundo (Controle)"] = ""
+
+    return out[["CNPJ", "Nome do fundo (Controle)"]]
+
 
 def carregar_controle(df_controle):
     if "CNPJ" not in df_controle.columns:
@@ -133,51 +303,66 @@ if processar:
         st.stop()
 
     try:
-        # Carrega e prepara
-        cadfi_raw = carregar_excel(cadfi_file)
-        controle_raw = carregar_excel(controle_file)
+        with st.spinner("Processando arquivos..."):
+            # Carrega e prepara
+            cadfi_raw = carregar_excel(cadfi_file)
+            controle_raw = carregar_excel(controle_file)
 
-        cadfi_filtrado = filtrar_cadfi(cadfi_raw)
-        controle_prep = carregar_controle(controle_raw)
+            cadfi_filtrado = filtrar_cadfi(cadfi_raw)
+            controle_prep = carregar_controle(controle_raw)
 
-        # Comparações
-        df_fora = comparar_cnpjs(cadfi_filtrado, controle_prep)
-        df_comum = comparar_fundos_em_comum(cadfi_filtrado, controle_prep)
+            # Comparações
+            df_fora = comparar_cnpjs(cadfi_filtrado, controle_prep)                 # CadFi -> não no Controle
+            df_comum = comparar_fundos_em_comum(cadfi_filtrado, controle_prep)      # Interseção
+            df_controle_fora = comparar_controle_fora_cadfi(cadfi_filtrado, controle_prep)  # Controle -> não no CadFi
 
-        # Relatórios prontos
-        rel_fora = relatorio_fora_controle(df_fora)
-        rel_comum = relatorio_em_comum(df_comum)
+            # Relatórios prontos
+            rel_fora = relatorio_fora_controle(df_fora)
+            rel_comum = relatorio_em_comum(df_comum)
+            rel_controle_fora = relatorio_controle_fora_cadfi(df_controle_fora)
 
-        # Exibe contagens
+        # Contagens
         st.success(f"✅ Em comum: {len(rel_comum)} fundo(s)")
-        st.warning(f"❌ Fora do Controle: {len(rel_fora)} fundo(s)")
+        st.info(f"ℹ️ No Controle e NÃO no CadFi: {len(rel_controle_fora)} fundo(s)")
+        st.warning(f"❌ Fora do Controle (presentes no CadFi, ausentes no Controle): {len(rel_fora)} fundo(s)")
 
-        # Prévia das tabelas
-        with st.expander("Visualizar — Fundos em Comum"):
+
+        with st.expander("📌 Fundos presentes em AMBOS (CadFi e Controle)"):
             st.dataframe(rel_comum, use_container_width=True, hide_index=True)
-        with st.expander("Visualizar — Fundos fora do Controle"):
+
+        with st.expander("❌ Fundos do CadFi que NÃO estão no Controle"):
             st.dataframe(rel_fora, use_container_width=True, hide_index=True)
 
+        with st.expander("ℹ️ Fundos do Controle que NÃO estão no CadFi"):
+            st.dataframe(rel_controle_fora, use_container_width=True, hide_index=True)
+
+
         # Downloads
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             st.download_button(
-                label="⬇️ Baixar Relatório — Em Comum (Excel)",
+                label="⬇️ Baixar — Fundos em AMBOS (CadFi e Controle)",
                 data=to_excel_bytes(rel_comum, sheet_name="Em_Comum"),
-                file_name="Relatorio_Fundos_Em_Comum.xlsx",
+                file_name="Relatorio_Fundos_Em_Ambos.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         with c2:
             st.download_button(
-                label="⬇️ Baixar Relatório — Fora do Controle (Excel)",
-                data=to_excel_bytes(rel_fora, sheet_name="Fora_do_Controle"),
-                file_name="Relatorio_Fundos_Fora_do_Controle.xlsx",
+                label="⬇️ Baixar — Somente no CadFi (não no Controle)",
+                data=to_excel_bytes(rel_fora, sheet_name="Somente_no_CadFi"),
+                file_name="Relatorio_Fundos_Somente_no_CadFi.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with c3:
+            st.download_button(
+                label="⬇️ Baixar — Somente no Controle (não no CadFi)",
+                data=to_excel_bytes(rel_controle_fora, sheet_name="Somente_no_Controle"),
+                file_name="Relatorio_Fundos_Somente_no_Controle.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
     except Exception as e:
         st.exception(e)
-        st.stop()
 
 st.markdown("---")
 st.caption("Dica: se as colunas do Excel vierem com acentos/variações, o app normaliza nomes para evitar erros.")
