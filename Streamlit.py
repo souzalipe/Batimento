@@ -95,6 +95,7 @@ VALORES_ATIVOS = {
     normaliza_texto("Ativo"),
     normaliza_texto("Ativa"),
     normaliza_texto("Em Atividade"),
+    normaliza_texto("A"),
 }
 
 def filtrar_status_ativos(df: pd.DataFrame) -> pd.DataFrame:
@@ -153,6 +154,7 @@ def comparar_controle_fora_cadfi(cadfi_df, controle_df):
     Espera que ambas as tabelas já tenham a coluna 'CNPJ' formatada.
     """
     return controle_df[~controle_df["CNPJ"].isin(set(cadfi_df["CNPJ"]))].copy()
+
 
 
 def _norm_header_key(s: str) -> str:
@@ -228,6 +230,67 @@ def relatorio_controle_fora_cadfi(df_controle: pd.DataFrame) -> pd.DataFrame:
         out["Nome do fundo (Controle)"] = ""
 
     return out[["CNPJ", "Nome do fundo (Controle)"]]
+
+# --- NOVO: excluir fundos indesejados pelo nome (apenas no Controle fora do CadFi) ---
+EXCLUIR_NOMES_CONTROLE = [
+    "BB CIN",
+    "BB BNC AÇÕES NOSSA CAIXA NOSSO CLUBE DE INVESTIMENTO",
+]
+
+def filtrar_controle_por_nome(df: pd.DataFrame,
+                              nomes_excluir=EXCLUIR_NOMES_CONTROLE) -> pd.DataFrame:
+    """
+    Remove do DF quaisquer linhas cujo 'nome do fundo' (coluna detectada)
+    contenha algum dos nomes/padrões informados (case/acentos-insensitive).
+    """
+    if df is None or df.empty:
+        return df
+
+    # Reusa seu detector de coluna de nome
+    col_nome = _encontrar_coluna_nome(df)
+    if not col_nome or col_nome not in df.columns:
+        # Falha silenciosa: se não achar a coluna de nome, não filtra
+        return df
+
+    nomes_norm = [normaliza_texto(n) for n in nomes_excluir]
+
+    out = df.copy()
+    out["_NOME_NORM_"] = out[col_nome].map(normaliza_texto)
+
+    # Exclui se QUALQUER padrão aparecer no nome normalizado
+    mask_excluir = out["_NOME_NORM_"].apply(lambda s: any(p in s for p in nomes_norm))
+    out = out[~mask_excluir].drop(columns=["_NOME_NORM_"])
+
+    return out
+
+# --- NOVO: excluir fundos do Controle por SITUACAO ('I' e 'P') ---
+EXCLUIR_SITUACAO_CONTROLE = ("I", "P")
+
+def filtrar_controle_por_situacao(df: pd.DataFrame,
+                                  excluir_codigos=EXCLUIR_SITUACAO_CONTROLE) -> pd.DataFrame:
+    """
+    Remove linhas do DF cujo 'status/situacao' seja 'I' ou 'P'.
+    - Detecção da coluna via _encontrar_coluna_status.
+    - Normaliza texto (sem acento/maiúsculas) e usa a 1ª letra como código.
+    - Ex.: 'Inativo' -> 'I', 'Paralisado' -> 'P'.
+    """
+    if df is None or df.empty:
+        return df
+
+    col_status = _encontrar_coluna_status(df)
+    if not col_status or col_status not in df.columns:
+        # Falha silenciosa se não achar coluna de situação/status
+        return df
+
+    excluir_norm = {normaliza_texto(x)[:1] for x in excluir_codigos}
+
+    out = df.copy()
+    # Extrai a 1ª letra do status normalizado (ou string vazia)
+    out["_SIT_"] = out[col_status].map(lambda x: normaliza_texto(x)[:1] if pd.notna(x) else "")
+    mask_excluir = out["_SIT_"].isin(excluir_norm)
+
+    out = out[~mask_excluir].drop(columns=["_SIT_"])
+    return out
 
 
 def carregar_controle(df_controle):
@@ -314,10 +377,18 @@ if processar:
             df_comum = comparar_fundos_em_comum(cadfi_filtrado, controle_prep)      # Interseção
             df_controle_fora = comparar_controle_fora_cadfi(cadfi_filtrado, controle_prep)  # Controle -> não no CadFi
 
+            # NOVO 1: remove por SITUACAO ('I' e 'P')
+            df_controle_fora = filtrar_controle_por_situacao(df_controle_fora)
+
+            # NOVO 2: remove pelos dois nomes específicos
+            df_controle_fora = filtrar_controle_por_nome(df_controle_fora)
+
             # Relatórios prontos
             rel_fora = relatorio_fora_controle(df_fora)
             rel_comum = relatorio_em_comum(df_comum)
             rel_controle_fora = relatorio_controle_fora_cadfi(df_controle_fora)
+
+
 
         # Contagens
         st.success(f"✅ Em comum: {len(rel_comum)} fundo(s)")
