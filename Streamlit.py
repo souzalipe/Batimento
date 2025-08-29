@@ -154,8 +154,6 @@ def comparar_controle_fora_cadfi(cadfi_df, controle_df):
     """
     return controle_df[~controle_df["CNPJ"].isin(set(cadfi_df["CNPJ"]))].copy()
 
-import re, unicodedata
-import pandas as pd
 
 def _norm_header_key(s: str) -> str:
     """
@@ -327,14 +325,15 @@ if processar:
         st.warning(f"❌ Fora do Controle (presentes no CadFi, ausentes no Controle): {len(rel_fora)} fundo(s)")
 
 
-        with st.expander("📌 Fundos presentes em AMBOS (CadFi e Controle)"):
+        with st.expander("✅ Fundos presentes em AMBOS (CadFi e Controle)"):
             st.dataframe(rel_comum, use_container_width=True, hide_index=True)
-
-        with st.expander("❌ Fundos do CadFi que NÃO estão no Controle"):
-            st.dataframe(rel_fora, use_container_width=True, hide_index=True)
 
         with st.expander("ℹ️ Fundos do Controle que NÃO estão no CadFi"):
             st.dataframe(rel_controle_fora, use_container_width=True, hide_index=True)
+            
+        with st.expander("❌ Fundos do CadFi que NÃO estão no Controle"):
+            st.dataframe(rel_fora, use_container_width=True, hide_index=True)
+
 
 
         # Downloads
