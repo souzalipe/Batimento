@@ -309,33 +309,43 @@ def comparar_fundos_em_comum(cadfi_df, controle_df):
 def relatorio_fora_controle(df):
     """Retorna DF pronto para exportar (CadFi fora do Controle)"""
     if df is None or df.empty:
-        return pd.DataFrame(columns=["CNPJ", "Nome do fundo", "Número de Protocolo (GFI)"])
+        return pd.DataFrame(columns=["CNPJ", "Nome do fundo"])
     df = df.copy()
-    df["GFI"] = df.get("GFI", "Não possui")
-    rel = df[["CNPJ", "Denominacao_Social", "GFI"]].rename(columns={
+    rel = df[["CNPJ", "Denominacao_Social"]].rename(columns={
         "Denominacao_Social": "Nome do fundo",
-        "GFI": "Número de Protocolo (GFI)"
     })
     return rel
 
 def relatorio_em_comum(df):
     """
     Retorna DF pronto para exportar (CadFi em comum com Controle)
-    Inclui duas colunas vazias: 'Protocolo' e 'Mes de Referencia'.
+    Inclui colunas: 'Protocolo-CDA', 'Mes_de_Referencia-CDA',
+    'Protocolo-Balancete', 'Mes_de_Referencia-Balancete'.
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=["CNPJ", "Nome do fundo", "Número de Protocolo (GFI)", "Protocolo", "Mes de Referencia"])
+        return pd.DataFrame(columns=[
+            "CNPJ", "Nome do fundo","Protocolo-CDA", "Mes_de_Referencia-CDA",
+            "Protocolo-Balancete", "Mes_de_Referencia-Balancete"
+        ])
+
     df = df.copy()
-    if "GFI" not in df.columns:
-        df["GFI"] = "Não possui"
-    # Colunas vazias conforme solicitado
-    df["Protocolo"] = ""
-    df["Mes de Referencia"] = ""
-    rel = df[["CNPJ", "Denominacao_Social", "GFI", "Protocolo", "Mes de Referencia"]].rename(columns={
+
+    # Garante que todas as colunas necessárias existam
+    df["Protocolo-CDA"] = df.get("Protocolo-CDA", "")
+    df["Mes_de_Referencia-CDA"] = df.get("Mes_de_Referencia-CDA", "")
+    df["Protocolo-Balancete"] = df.get("Protocolo-Balancete", "")
+    df["Mes_de_Referencia-Balancete"] = df.get("Mes_de_Referencia-Balancete", "")
+
+    # Monta o relatório
+    rel = df[[
+        "CNPJ", "Denominacao_Social","Protocolo-CDA", "Mes_de_Referencia-CDA",
+        "Protocolo-Balancete", "Mes_de_Referencia-Balancete"
+    ]].rename(columns={
         "Denominacao_Social": "Nome do fundo",
-        "GFI": "Número de Protocolo (GFI)"
     })
+
     return rel
+
 
 def to_excel_bytes(df, sheet_name="Relatorio"):
     buffer = io.BytesIO()
@@ -344,10 +354,229 @@ def to_excel_bytes(df, sheet_name="Relatorio"):
     buffer.seek(0)
     return buffer
 
+# ======================= /CDA =====================================================
+
+def _normaliza_competencia_mm_aaaa(valor: str) -> str:
+    """
+    Normaliza entradas como '2025-06-01 00:00:00', '01/06/2025' ou '06/2025' para '06/2025'.
+    """
+    s = str(valor or "").strip()
+    if not s:
+        return ""
+
+    # Ex.: 2025-06-01 ou 2025/06/...
+    m_iso = re.search(r'(20\d{2})-/', s)
+    if m_iso:
+        y, mth = m_iso.groups()
+        return f"{int(mth):02d}/{y}"
+
+    # Ex.: 01/06/2025 ou 06/01/2025 (decide o mês coerente)
+    m_dmy = re.search(r'(\d{1,2})/-/-', s)
+    if m_dmy:
+        a, b, y = m_dmy.groups()
+        a, b = int(a), int(b)
+        mth = a if a <= 12 else b
+        return f"{int(mth):02d}/{y}"
+
+    # Ex.: 06/2025
+    m_my = re.search(r'(0?[1-9]|1[0-2])/-', s)
+    if m_my:
+        mth, y = m_my.groups()
+        return f"{int(mth):02d}/{y}"
+
+    return s or ""
+
+
+def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
+    """
+    Converte o Excel de protocolos (layout de texto em linhas) em um DF tabular:
+      CNPJ_Masked | CNPJ_Num | Participante | CDA_Protocolo | CDA_Competencia | Data_Acao
+    Mantém 1 linha por CNPJ (o protocolo mais RECENTE pela Data_Acao).
+    """
+    df_raw = pd.read_excel(arquivo_xlsx, sheet_name=0, header=None, dtype=str)
+
+    # Achatar todas as células em lista de linhas não-vazias (ordem preservada)
+    lines = []
+    for _, row in df_raw.iterrows():
+        for val in row.values:
+            if pd.isna(val):
+                continue
+            txt = str(val).strip()
+            if txt:
+                lines.append((len(lines), txt))
+
+    n = len(lines)
+    registros = []
+
+    for i in range(n):
+        _, text = lines[i]
+        low = text.lower()
+
+        # Marcador do bloco do protocolo (várias variantes)
+        if low.startswith('nº protocolo') or low.startswith('n° protocolo') or low.startswith('no protocolo') \
+           or low.startswith('nº do protocolo') or low.startswith('n° do protocolo'):
+            # 1) Pega o valor do Nº Protocolo (primeira linha "não-cabeçalho" abaixo)
+            protocolo = None
+            j = i + 1
+            while j < n:
+                _, t2 = lines[j]
+                low2 = t2.lower()
+                # pula rótulos/cabeçalhos usuais
+                if re.match(
+                    r'^(protocolo de confirm|status:|informe:|opera|documento:|compet|usuário|usuario|nº do recebimento|nome do arquivo|participante:|tipo do participante|data ação:|data acao:)',
+                    low2
+                ):
+                    j += 1
+                    continue
+                # valor candidato
+                protocolo = t2.strip()
+                # limpa sufixo '.0' que pode vir do Excel
+                if protocolo.endswith(".0"):
+                    protocolo = protocolo[:-2]
+                break
+                j += 1
+
+            # 2) Sobe até "Participante:" para capturar nome e CNPJ
+            cnpj_masked, participante = None, None
+            k = i
+            while k >= 0:
+                _, tprev = lines[k]
+                lowp = tprev.lower()
+                if lowp.startswith('participante'):
+                    first_name = None
+                    kk = k + 1
+                    while kk < n:
+                        _, tline = lines[kk]
+                        low2 = tline.lower()
+                        # limites do bloco
+                        if low2.startswith('tipo do participante') or low2.startswith('data ação') or low2.startswith('data acao') or low2.startswith('nº protocolo') or low2.startswith('n° protocolo') or low2.startswith('nº do protocolo') or low2.startswith('n° do protocolo'):
+                            break
+                        # primeiro texto após "Participante:" é o nome
+                        if first_name is None and tline:
+                            first_name = tline.strip()
+                        # CNPJ pode estar nessa linha ou na próxima (entre parênteses)
+                        m = re.search(r'(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})', tline)
+                        if m:
+                            cnpj_masked = m.group(1)
+                            break
+                        kk += 1
+                    participante = first_name
+                    break
+                k -= 1
+
+            # 3) Competência (acima)
+            competencia_raw = None
+            k = i
+            while k >= 0:
+                _, tprev = lines[k]
+                lowp = tprev.lower()
+                if lowp.startswith('competência') or lowp.startswith('competencia'):
+                    kk = k + 1
+                    while kk < n:
+                        _, tval = lines[kk]
+                        if tval:
+                            competencia_raw = tval.strip()
+                            break
+                        kk += 1
+                    break
+                k -= 1
+
+            # 4) Data Ação (acima)
+            data_acao_raw = None
+            k = i
+            while k >= 0:
+                _, tprev = lines[k]
+                lowp = tprev.lower()
+                if lowp.startswith('data ação') or lowp.startswith('data acao'):
+                    kk = k + 1
+                    while kk < n:
+                        _, tval = lines[kk]
+                        if tval:
+                            data_acao_raw = tval.strip()
+                            break
+                        kk += 1
+                    break
+                k -= 1
+
+            # Monta registro (se tiver CNPJ e Protocolo)
+            if cnpj_masked and protocolo:
+                cnpj_num = normaliza_cnpj(cnpj_masked)  # helper seu
+                comp = _normaliza_competencia_mm_aaaa(competencia_raw)
+                try:
+                    data_acao = pd.to_datetime(data_acao_raw, dayfirst=True, errors='coerce') if data_acao_raw else pd.NaT
+                except Exception:
+                    data_acao = pd.NaT
+
+                registros.append({
+                    "CNPJ_Masked": cnpj_masked,
+                    "CNPJ_Num": cnpj_num,
+                    "Participante": participante,
+                    "CDA_Protocolo": protocolo,
+                    "CDA_Competencia": comp,
+                    "Data_Acao": data_acao
+                })
+
+    df = pd.DataFrame(registros)
+    if df.empty:
+        return df
+
+    # Mantém o protocolo mais recente por CNPJ (pela Data_Acao)
+    df = df.sort_values(["CNPJ_Num", "Data_Acao"], ascending=[True, False]).drop_duplicates("CNPJ_Num", keep="first")
+    return df
+
+
+def enriquecer_em_comum_com_cda(rel_em_comum_df: pd.DataFrame, df_cda: pd.DataFrame) -> pd.DataFrame:
+    """
+    Recebe o DF 'Relatorio_Fundos_Em_Ambos' (com colunas 'CNPJ', 'Protocolo', 'Mes de Referencia' etc.)
+    e adiciona as colunas 'CDA_Protocolo' e 'CDA_Competencia' posicionadas depois de 'Mes de Referencia'.
+    Onde não houver match, preenche com 'Não possui'.
+    """
+    if rel_em_comum_df is None or rel_em_comum_df.empty:
+        out = rel_em_comum_df.copy()
+        if "CDA_Protocolo" not in out.columns:
+            out["CDA_Protocolo"] = ""
+        if "CDA_Competencia" not in out.columns:
+            out["CDA_Competencia"] = ""
+        return out
+
+    if df_cda is None or df_cda.empty:
+        out = rel_em_comum_df.copy()
+        out["CDA_Protocolo"] = "Não possui"
+        out["CDA_Competencia"] = "Não possui"
+        return out
+
+    rel = rel_em_comum_df.copy()
+    rel["CNPJ_Num"] = rel["CNPJ"].map(normaliza_cnpj)
+
+    enx = rel.merge(
+        df_cda[["CNPJ_Num", "CDA_Protocolo", "CDA_Competencia"]],
+        on="CNPJ_Num", how="left"
+    )
+    enx["CDA_Protocolo"] = enx["CDA_Protocolo"].fillna("Não possui")
+    enx["CDA_Competencia"] = enx["CDA_Competencia"].fillna("Não possui")
+
+    # Posiciona após "Mes de Referencia" (se existir), senão ao final
+    cols = list(enx.columns)
+    insert_pos = cols.index("Mes de Referencia") + 1 if "Mes de Referencia" in cols else len(cols)
+    for newcol in ["CDA_Protocolo", "CDA_Competencia"]:
+        if newcol in cols:
+            cols.remove(newcol)
+    cols = cols[:insert_pos] + ["CDA_Protocolo", "CDA_Competencia"] + cols[insert_pos:]
+    enx = enx[cols]
+
+    # Remove auxiliar
+    if "CNPJ_Num" in enx.columns:
+        enx = enx.drop(columns=["CNPJ_Num"])
+
+    return enx
+
+# ======================= /CDA =====================================================
+
+
 # ========================== INTERFACE STREAMLIT ==========================
 st.set_page_config(page_title="Batimento de Fundos - CadFi x Controle", page_icon="📊", layout="centered")
 
-st.title("📊 Batimento de Fundos — CadFi x Controle")
+st.title("📊 1° - Batimento de Fundos — CadFi x Controle")
 st.caption("Interface web dos Batimentos. Faça o upload dos dois arquivos e clique em **Processar**.")
 
 col1, col2 = st.columns(2)
@@ -373,8 +602,8 @@ if processar:
             controle_prep = carregar_controle(controle_raw)
 
             # Comparações
-            df_fora = comparar_cnpjs(cadfi_filtrado, controle_prep)                 # CadFi -> não no Controle
-            df_comum = comparar_fundos_em_comum(cadfi_filtrado, controle_prep)      # Interseção
+            df_fora = comparar_cnpjs(cadfi_filtrado, controle_prep)                         # CadFi -> não no Controle
+            df_comum = comparar_fundos_em_comum(cadfi_filtrado, controle_prep)              # Interseção
             df_controle_fora = comparar_controle_fora_cadfi(cadfi_filtrado, controle_prep)  # Controle -> não no CadFi
 
             # NOVO 1: remove por SITUACAO ('I' e 'P')
@@ -436,3 +665,58 @@ if processar:
 
 st.markdown("---")
 st.caption("Dica: se as colunas do Excel vierem com acentos/variações, o app normaliza nomes para evitar erros.")
+
+# ========================== INTERFACE: CDA (Enriquecer "Em Ambos") ==========================
+st.markdown("---")
+st.subheader("📄 CDA — Enriquecer o relatório **Fundos em Ambos** com Protocolo/Competência")
+
+col_cda1, col_cda2 = st.columns(2)
+with col_cda1:
+    rel_ambos_file = st.file_uploader("Relatório — Fundos em Ambos (xlsx)", type=["xlsx"], key="rel_ambos_cda")
+with col_cda2:
+    cda_proto_file = st.file_uploader("Planilha de Protocolo do CDA (xlsx)", type=["xlsx"], key="cda_proto_file")
+
+bt_cda = st.button("Preencher colunas do CDA", type="primary", key="btn_cda_process")
+
+if bt_cda:
+    if not rel_ambos_file or not cda_proto_file:
+        st.error("⚠️ Envie **os dois arquivos**: (1) Relatório 'Em Ambos' e (2) Protocolo do CDA.")
+        st.stop()
+    try:
+        with st.spinner("Lendo arquivos e integrando CDA..."):
+            # Carrega o relatório 'Em Ambos'
+            df_ambos = pd.read_excel(rel_ambos_file, dtype=str)
+            df_ambos = padronizar_colunas(df_ambos)
+
+            if "CNPJ" not in df_ambos.columns:
+                st.error("O relatório 'Em Ambos' precisa ter a coluna 'CNPJ'.")
+                st.stop()
+
+            # Garante colunas esperadas (caso venham ausentes)
+            if "Protocolo" not in df_ambos.columns:
+                df_ambos["Protocolo"] = ""
+            if "Mes de Referencia" not in df_ambos.columns:
+                df_ambos["Mes de Referencia"] = ""
+
+            # Carrega e parseia o CDA
+            df_cda = parse_protocolos_cda_xlsx(cda_proto_file)
+
+            # Enriquecer
+            df_final = enriquecer_em_comum_com_cda(df_ambos, df_cda)
+
+            # Métricas
+            tot = len(df_final)
+            casados = df_final["CDA_Protocolo"].astype(str).str.strip().ne("Não possui").sum()
+            st.success(f"✅ Encontramos protocolo do CDA para {casados} de {tot} fundos.")
+
+            with st.expander("🔎 Prévia do relatório enriquecido"):
+                st.dataframe(df_final, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                label="⬇️ Baixar — 'Em Ambos' enriquecido com CDA",
+                data=to_excel_bytes(df_final, sheet_name="Em_Ambos_com_CDA"),
+                file_name="Relatorio_Em_Ambos_com_CDA.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+    except Exception as e:
+        st.exception(e)
