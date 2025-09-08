@@ -4,6 +4,159 @@ import unicodedata
 from pathlib import Path
 import pandas as pd
 import streamlit as st
+from typing import Optional, Tuple
+
+# === [NOVO BLOCO] Extração de Protocolo e Competência do Balancete ===
+from typing import Optional, Tuple
+import re
+
+# Mapa de meses PT-BR -> número
+MESES_PT = {
+    "JAN": 1, "JANEIRO": 1,
+    "FEV": 2, "FEVEREIRO": 2,
+    "MAR": 3, "MARCO": 3, "MARÇO": 3,
+    "ABR": 4, "ABRIL": 4,
+    "MAI": 5, "MAIO": 5,
+    "JUN": 6, "JUNHO": 6,
+    "JUL": 7, "JULHO": 7,
+    "AGO": 8, "AGOSTO": 8,
+    "SET": 9, "SETEMBRO": 9, "SETEM": 9, "SETEMB": 9,
+    "OUT": 10, "OUTUBRO": 10,
+    "NOV": 11, "NOVEMBRO": 11,
+    "DEZ": 12, "DEZEMBRO": 12,
+}
+
+def _format_competencia_yyyy_mm(ano: int, mes: int) -> str:
+    mes = max(1, min(12, int(mes)))
+    return f"{int(ano):04d}-{mes:02d}"
+
+def _parse_competencia(texto: str) -> Optional[str]:
+    """
+    Aceita formatos como:
+      - 08/2025, 08-2025
+      - 2025-08, 2025/08
+      - AGO/2025, AGOSTO 2025, etc.
+    Retorna 'YYYY-MM' ou None.
+    """
+    T = normaliza_texto(texto)
+
+    # 1)  MM/AAAA  ou  MM-AAAA
+    m = re.search(r"\b(\d{1,2})/-\b", T)
+    if m:
+        mes, ano = int(m.group(1)), int(m.group(2))
+        if 1 <= mes <= 12:
+            return _format_competencia_yyyy_mm(ano, mes)
+
+    # 2)  AAAA-MM  ou  AAAA/MM
+    m = re.search(r"\b(\d{4})/-\b", T)
+    if m:
+        ano, mes = int(m.group(1)), int(m.group(2))
+        if 1 <= mes <= 12:
+            return _format_competencia_yyyy_mm(ano, mes)
+
+    # 3)  Mês por extenso/abreviado + AAAA (ex.: AGO/2025, AGOSTO 2025)
+    m = re.search(r"\b([A-ZÇÃÉ]+)[\s/.-]*(\d{4})\b", T)
+    if m:
+        mes_txt, ano = m.group(1), int(m.group(2))
+        mes = MESES_PT.get(mes_txt)
+        if mes:
+            return _format_competencia_yyyy_mm(ano, mes)
+
+    return None
+
+def _eh_cnpj_sequencia(numeros: str) -> bool:
+    """Retorna True se a sequência for um CNPJ (14 dígitos). Não valida dígitos verificadores."""
+    d = re.sub(r"\D", "", str(numeros or ""))
+    return len(d) == 14
+
+def _parse_protocolo(texto: str) -> Optional[str]:
+    """
+    Procura 'PROTOCOLO' / 'NÚMERO DE PROTOCOLO' / 'GFI' seguido de dígitos.
+    Se não achar, tenta o maior bloco numérico >= 6 dígitos, ignorando CNPJ (14 dígitos).
+    """
+    T = normaliza_texto(texto)
+
+    # Rótulos explícitos
+    m = re.search(r"(?:PROTOCOLO|NUMERO\s*DE\s*PROTOCOLO|GFI)\D*(\d{6,})", T, flags=re.I)
+    if m:
+        valor = m.group(1)
+        if not _eh_cnpj_sequencia(valor):
+            return valor
+
+    # Fallback: maior bloco numérico (>=6), ignorando CNPJ
+    candidatos = re.findall(r"\b(\d{6,})\b", T)
+    candidatos = [c for c in candidatos if not _eh_cnpj_sequencia(c)]
+    if candidatos:
+        # Heurística simples: o mais longo
+        return max(candidatos, key=len)
+
+    return None
+
+def _read_text_from_xlsx(uploaded_file) -> str:
+    """
+    Lê as primeiras linhas do XLSX (sem header) para capturar cabeçalhos/rodapés do balancete.
+    """
+    try:
+        df_head = pd.read_excel(uploaded_file, header=None, nrows=40, dtype=str, engine="openpyxl")
+        texto = " ".join(df_head.astype(str).fillna("").values.ravel())
+        return texto
+    except Exception:
+        return ""
+    finally:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+
+def _read_text_from_pdf(uploaded_file) -> str:
+    """
+    Lê texto de PDF usando PyMuPDF (fitz) se disponível. Se não estiver instalado, retorna string vazia.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception:
+        return ""
+
+    try:
+        data = uploaded_file.read()
+        texto = ""
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            for page in doc:
+                texto += " " + page.get_text("text")
+        return texto
+    except Exception:
+        return ""
+    finally:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+
+def extrair_protocolo_e_competencia_do_balancete(uploaded_file) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Retorna (protocolo, competencia_YYYY-MM) a partir do conteúdo do balancete.
+    - Suporta .xlsx (lê as primeiras linhas) e .pdf (se PyMuPDF estiver disponível).
+    - Também tenta extrair a partir do nome do arquivo como fallback.
+    """
+    if not uploaded_file:
+        return (None, None)
+
+    nome = str(getattr(uploaded_file, "name", "")).lower()
+    texto = ""
+
+    if nome.endswith(".xlsx"):
+        texto = _read_text_from_xlsx(uploaded_file)
+    elif nome.endswith(".pdf"):
+        texto = _read_text_from_pdf(uploaded_file)
+
+    # Fallback: incluir o nome do arquivo na busca
+    texto_total = f"{texto}  {getattr(uploaded_file, 'name', '')}"
+
+    protocolo = _parse_protocolo(texto_total)
+    competencia = _parse_competencia(texto_total)
+
+    return (protocolo, competencia)
+# === [FIM DO BLOCO NOVO] ===
 
 
 
@@ -319,27 +472,21 @@ def relatorio_fora_controle(df):
 def relatorio_em_comum(df):
     """
     Retorna DF pronto para exportar (CadFi em comum com Controle)
-    Inclui colunas: 'Protocolo-CDA', 'Mes_de_Referencia-CDA',
-    'Protocolo-Balancete', 'Mes_de_Referencia-Balancete'.
+
     """
     if df is None or df.empty:
         return pd.DataFrame(columns=[
-            "CNPJ", "Nome do fundo","Protocolo-CDA", "Mes_de_Referencia-CDA",
-            "Protocolo-Balancete", "Mes_de_Referencia-Balancete"
+            "CNPJ", "Nome do fundo"
         ])
 
     df = df.copy()
 
     # Garante que todas as colunas necessárias existam
-    df["Protocolo-CDA"] = df.get("Protocolo-CDA", "")
-    df["Mes_de_Referencia-CDA"] = df.get("Mes_de_Referencia-CDA", "")
-    df["Protocolo-Balancete"] = df.get("Protocolo-Balancete", "")
-    df["Mes_de_Referencia-Balancete"] = df.get("Mes_de_Referencia-Balancete", "")
+    
 
     # Monta o relatório
     rel = df[[
-        "CNPJ", "Denominacao_Social","Protocolo-CDA", "Mes_de_Referencia-CDA",
-        "Protocolo-Balancete", "Mes_de_Referencia-Balancete"
+        "CNPJ", "Denominacao_Social"
     ]].rename(columns={
         "Denominacao_Social": "Nome do fundo",
     })
@@ -385,6 +532,21 @@ def _normaliza_competencia_mm_aaaa(valor: str) -> str:
         return f"{int(mth):02d}/{y}"
 
     return s or ""
+
+def remover_segundos_colunas(df: pd.DataFrame, colunas, formato: str = "%Y-%m-%d %H:%M") -> pd.DataFrame:
+    df = df.copy()
+    for col in colunas:
+        if col in df.columns:
+            s = pd.to_datetime(df[col], errors="coerce")
+            # Datetimes válidos: aplica formatação sem segundos
+            df.loc[s.notna(), col] = s[s.notna()].dt.strftime(formato)
+            # Fallback: se for string/valor que não parseia, remove o ":ss" final
+            df.loc[s.isna(), col] = (
+                df.loc[s.isna(), col]
+                .astype(str)
+                .str.replace(r":\d{2}(?=\b)", "", regex=True)
+            )
+    return df
 
 
 def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
@@ -572,11 +734,136 @@ def enriquecer_em_comum_com_cda(rel_em_comum_df: pd.DataFrame, df_cda: pd.DataFr
 
 # ======================= /CDA =====================================================
 
+# ======================== Balancete ===============================================
+
+import itertools
+
+def _linhas_excel_como_texto(arquivo_excel) -> list[str]:
+    """
+    Lê todas as células do Excel (todas as abas) e retorna uma sequência de linhas de texto.
+    """
+    # Carrega todas as sheets como strings
+    xls = pd.ExcelFile(arquivo_excel, engine="openpyxl")
+    linhas = []
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet, dtype=str, header=None, engine="openpyxl")
+        # varre célula a célula preservando a ordem visual por linhas
+        for _, row in df.iterrows():
+            for val in row.tolist():
+                s = str(val).strip() if pd.notna(val) else ""
+                if s:
+                    linhas.append(s)
+    # normaliza espaços
+    return [unicodedata.normalize("NFKD", s).strip() for s in linhas if s.strip()]
+
+def _extrair_mm_yyyy_de_nome_arquivo(linhas: list[str]) -> Optional[str]:
+    """
+    Procura 'Nome do Arquivo' e tenta extrair sufixo MMYYYY (ex.: ... 062025.CVM -> 06/2025).
+    Retorna 'MM/YYYY' ou None.
+    """
+    mm_yyyy = None
+    for i, text in enumerate(linhas):
+        if text.upper().startswith("NOME DO ARQUIVO"):
+            # próxima(s) linha(s) contém o nome. Pegamos a seguinte não vazia
+            for j in range(i+1, min(i+5, len(linhas))):
+                cand = linhas[j]
+                # captura 6 dígitos seguidos
+                m = re.search(r"(\d{6})(?!\d)", cand)
+                if m:
+                    mm = m.group(1)[:2]
+                    yyyy = m.group(1)[2:]
+                    mm_yyyy = f"{mm}/{yyyy}"
+                    return mm_yyyy
+    return mm_yyyy
+
+def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
+    """
+    Lê o arquivo 'Protocolo Balancete CVM ... .xlsx' e retorna um DataFrame com:
+    ['CNPJ', 'Balancete_Protocolo', 'Balancete_Competencia']
+    """
+    linhas = _linhas_excel_como_texto(arquivo_excel)
+
+    # Vamos varrer sequencialmente, guardando a 'Competência' vigente e o CNPJ do bloco
+    atual_comp = _extrair_mm_yyyy_de_nome_arquivo(linhas)  # prioridade ao Nome do Arquivo
+    registros = []
+
+    def _tenta_pegar_competencia(idx):
+        # Se não achamos via Nome do Arquivo, tenta a linha imediatamente seguinte à etiqueta
+        if idx + 1 < len(linhas):
+            raw = linhas[idx+1]
+            # tenta data dd/mm/aaaa ou mm/dd/aaaa; transforma em MM/YYYY quando possível
+            m = re.search(r"(\d{2})/(\d{2})/(\d{4})", raw)
+            if m:
+                a, b, y = m.groups()
+                # heurística: se há 'Nome do Arquivo' com MMYYYY, já teríamos atual_comp.
+                # Como fallback, vamos assumir que há um mês válido em {a,b}.
+                # Preferimos interpretar como MM/DD/YYYY (a=MM) para alinhar ao sufixo '062025'.
+                mm = a
+                return f"{mm}/{y}"
+        return None
+    i = 0
+    while i < len(linhas):
+        s = linhas[i].upper()
+        if s.startswith("COMPETÊNCIA"):
+            # atualiza competência apenas se ainda não definido por Nome do Arquivo
+            if not atual_comp:
+                comp_try = _tenta_pegar_competencia(i)
+                if comp_try:
+                    atual_comp = comp_try
+
+        elif s.startswith("PARTICIPANTE"):
+            # Espera-se: próxima linha = nome; seguinte = (CNPJ)
+            cnpj_fmt = None
+            # procura CNPJ entre parênteses nas próximas 3-4 linhas
+            for j in range(i+1, min(i+6, len(linhas))):
+                m = re.search(r"\((\d{2}\.\d{3}\.\d{3}/\d{4}\-\d{2})\)", linhas[j])
+                if m:
+                    cnpj_fmt = m.group(1)
+                    break
+            cnpj_norm = normaliza_cnpj(cnpj_fmt) if cnpj_fmt else None
+
+            # Agora avançamos até encontrar "Nº Protocolo"
+            protocolo = None
+            k = j if cnpj_fmt else i+1
+            while k < len(linhas) and protocolo is None:
+                if linhas[k].upper().startswith("Nº PROTOCOLO"):
+                    # valor na linha seguinte
+                    if k + 1 < len(linhas):
+                        protocolo = linhas[k+1].strip()
+                    break
+                # Blocos são curtos; se encontrar outro "Protocolo de Confirmação" ou "Participante", para
+                if "PROTOCOLO DE CONFIRMA" in linhas[k].upper() or linhas[k].upper().startswith("PARTICIPANTE"):
+                    break
+                k += 1
+
+            if cnpj_norm:
+                registros.append({
+                    "CNPJ": formatar_cnpj(cnpj_norm),
+                    "Balancete_Protocolo": protocolo or "",
+                    "Balancete_Competencia": atual_comp or ""
+                })
+
+            # continua a partir de k
+            i = max(i+1, k+1 if protocolo else i+1)
+            continue
+
+        i += 1
+
+    if not registros:
+        return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"])
+
+    df = pd.DataFrame(registros)
+    # remove duplicados por CNPJ, preservando o primeiro (ou use a mais recente lógica que preferir)
+    df = df.drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
+    return df
+
+
 
 # ========================== INTERFACE STREAMLIT ==========================
 st.set_page_config(page_title="Batimento de Fundos - CadFi x Controle", page_icon="📊", layout="centered")
 
-st.title("📊 1° - Batimento de Fundos — CadFi x Controle")
+st.title("Batimento de Fundos — Contabilidade")
+st.subheader("📊 1° - Batimento de Fundos — CadFi x Controle")
 st.caption("Interface web dos Batimentos. Faça o upload dos dois arquivos e clique em **Processar**.")
 
 col1, col2 = st.columns(2)
@@ -615,6 +902,7 @@ if processar:
             # Relatórios prontos
             rel_fora = relatorio_fora_controle(df_fora)
             rel_comum = relatorio_em_comum(df_comum)
+            rel_comum = remover_segundos_colunas(rel_comum, ["CDA_Protocolo", "CDA_Competencia"])
             rel_controle_fora = relatorio_controle_fora_cadfi(df_controle_fora)
 
 
@@ -668,13 +956,14 @@ st.caption("Dica: se as colunas do Excel vierem com acentos/variações, o app n
 
 # ========================== INTERFACE: CDA (Enriquecer "Em Ambos") ==========================
 st.markdown("---")
-st.subheader("📄 CDA — Enriquecer o relatório **Fundos em Ambos** com Protocolo/Competência")
+st.subheader("📄 2° CDA — Enriquecer o relatório **Fundos em Ambos** com Protocolo/Competência")
 
 col_cda1, col_cda2 = st.columns(2)
 with col_cda1:
     rel_ambos_file = st.file_uploader("Relatório — Fundos em Ambos (xlsx)", type=["xlsx"], key="rel_ambos_cda")
 with col_cda2:
     cda_proto_file = st.file_uploader("Planilha de Protocolo do CDA (xlsx)", type=["xlsx"], key="cda_proto_file")
+
 
 bt_cda = st.button("Preencher colunas do CDA", type="primary", key="btn_cda_process")
 
@@ -691,12 +980,6 @@ if bt_cda:
             if "CNPJ" not in df_ambos.columns:
                 st.error("O relatório 'Em Ambos' precisa ter a coluna 'CNPJ'.")
                 st.stop()
-
-            # Garante colunas esperadas (caso venham ausentes)
-            if "Protocolo" not in df_ambos.columns:
-                df_ambos["Protocolo"] = ""
-            if "Mes de Referencia" not in df_ambos.columns:
-                df_ambos["Mes de Referencia"] = ""
 
             # Carrega e parseia o CDA
             df_cda = parse_protocolos_cda_xlsx(cda_proto_file)
@@ -720,3 +1003,60 @@ if bt_cda:
             )
     except Exception as e:
         st.exception(e)
+
+#====================================== Interface de Balancete -============================
+
+st.markdown("## 🔄 3° - Enriquecer batimento com Balancete")
+colb1, colb2 = st.columns(2)
+with colb1:
+    relatorio_ambos_file = st.file_uploader("Arquivo Relatório de Ambos (.xlsx)", type=["xlsx"], key="relatorio_ambos")
+with colb2:
+    
+    balancete_file = st.file_uploader(
+        "Arquivo de Balancete (XLSX ou PDF)",
+        type=["xlsx", "pdf"],
+        accept_multiple_files=False
+    )
+
+
+enriquecer = st.button("Preencher colunas Balancete", type="primary", key="btn_balancete_enriquecer")
+
+if enriquecer:
+    if not relatorio_ambos_file or not balancete_file:
+        st.error("⚠️ Envie os dois arquivos antes de enriquecer.")
+        st.stop()
+
+    try:
+        with st.spinner("Enriquecendo com Balancete..."):
+            # Carrega os arquivos
+            df_rel_comum = carregar_excel(relatorio_ambos_file)
+            df_balancete = carregar_excel(balancete_file)
+
+            # Padroniza colunas
+            df_rel_comum = padronizar_colunas(df_rel_comum)
+            df_balancete = padronizar_colunas(df_balancete)
+
+            # Normaliza CNPJ
+            df_rel_comum["CNPJ"] = df_rel_comum["CNPJ"].apply(normaliza_cnpj).apply(formatar_cnpj)
+            df_balancete["CNPJ"] = df_balancete["CNPJ"].apply(normaliza_cnpj).apply(formatar_cnpj)
+
+            # Enriquecimento
+            rel_enriquecido = df_rel_comum.merge(
+                df_balancete[["CNPJ", "Protocolo", "Mes de Referencia"]],
+                on="CNPJ",
+                how="left"
+            )
+
+            st.success(f"✅ Enriquecido com {rel_enriquecido['Protocolo'].notna().sum()} protocolos encontrados.")
+            st.dataframe(rel_enriquecido, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                label="⬇️ Baixar — Relatório Enriquecido com Balancete",
+                data=to_excel_bytes(rel_enriquecido, sheet_name="Enriquecido"),
+                file_name="Relatorio_Enriquecido_Balancete.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+    except Exception as e:
+        st.exception(e)
+
+
