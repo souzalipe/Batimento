@@ -1018,19 +1018,17 @@ if enriquecer:
             df_rel_comum = carregar_excel(relatorio_ambos_file)
             df_balancete = carregar_excel(balancete_file)
             
-            # --- Adicionando protocolos e competência do balancete no arquivo "ambos" ---
 
             # Seleciona apenas as colunas de interesse do balancete
-            df_balancete_reduzido = df_balancete[["CNPJ", "protocolo", "competencia"]].drop_duplicates()
+            df_balancete_reduzido = df_balancete[["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"]].drop_duplicates()
 
             # Faz o merge com base no CNPJ
-            df_ambos_final = df_ambos.merge(df_balancete_reduzido, on="CNPJ", how="left")
+            df_ambos_final = df_rel_comum.merge(df_balancete_reduzido, on="CNPJ", how="left")
 
             # Salva o resultado
             df_ambos_final.to_excel("ambos_com_protocolo_competencia.xlsx", index=False)
 
             st.success("Arquivo 'ambos_com_protocolo_competencia.xlsx' gerado com sucesso!")
-
 
             # Padroniza colunas
             df_rel_comum = padronizar_colunas(df_rel_comum)
