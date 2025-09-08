@@ -31,31 +31,24 @@ def _format_competencia_yyyy_mm(ano: int, mes: int) -> str:
     return f"{int(ano):04d}-{mes:02d}"
 
 def _parse_competencia(texto: str) -> Optional[str]:
-    """
-    Aceita formatos como:
-      - 08/2025, 08-2025
-      - 2025-08, 2025/08
-      - AGO/2025, AGOSTO 2025, etc.
-    Retorna 'YYYY-MM' ou None.
-    """
     T = normaliza_texto(texto)
 
-    # 1)  MM/AAAA  ou  MM-AAAA
-    m = re.search(r"\b(\d{1,2})/-\b", T)
+    # 1) MM/AAAA ou MM-AAAA
+    m = re.search(r"\b(\d{1,2})[/\-](\d{4})\b", T)
     if m:
         mes, ano = int(m.group(1)), int(m.group(2))
         if 1 <= mes <= 12:
             return _format_competencia_yyyy_mm(ano, mes)
 
-    # 2)  AAAA-MM  ou  AAAA/MM
-    m = re.search(r"\b(\d{4})/-\b", T)
+    # 2) AAAA-MM ou AAAA/MM
+    m = re.search(r"\b(\d{4})[/\-](\d{1,2})\b", T)
     if m:
         ano, mes = int(m.group(1)), int(m.group(2))
         if 1 <= mes <= 12:
             return _format_competencia_yyyy_mm(ano, mes)
 
-    # 3)  Mês por extenso/abreviado + AAAA (ex.: AGO/2025, AGOSTO 2025)
-    m = re.search(r"\b([A-ZÇÃÉ]+)[\s/.-]*(\d{4})\b", T)
+    # 3) Nome do mês (abreviado ou completo) + AAAA
+    m = re.search(r"\b([A-ZÇÃÉ]+)[\s/.\-]*(\d{4})\b", T)
     if m:
         mes_txt, ano = m.group(1), int(m.group(2))
         mes = MESES_PT.get(mes_txt)
@@ -503,35 +496,28 @@ def to_excel_bytes(df, sheet_name="Relatorio"):
 
 # ======================= /CDA =====================================================
 
-def _normaliza_competencia_mm_aaaa(valor: str) -> str:
-    """
-    Normaliza entradas como '2025-06-01 00:00:00', '01/06/2025' ou '06/2025' para '06/2025'.
-    """
-    s = str(valor or "").strip()
+def _normaliza_competencia_mm_aaaa(s: str) -> Optional[str]:
     if not s:
-        return ""
+        return None
 
-    # Ex.: 2025-06-01 ou 2025/06/...
-    m_iso = re.search(r'(20\d{2})-/', s)
+    s = s.strip()
+
+    # Formato 20YY-MM ou 20YY/MM
+    m_iso = re.search(r'(20\d{2})[/\-](\d{2})', s)
     if m_iso:
-        y, mth = m_iso.groups()
-        return f"{int(mth):02d}/{y}"
+        ano, mes = int(m_iso.group(1)), int(m_iso.group(2))
+        if 1 <= mes <= 12:
+            return _format_competencia_yyyy_mm(ano, mes)
 
-    # Ex.: 01/06/2025 ou 06/01/2025 (decide o mês coerente)
-    m_dmy = re.search(r'(\d{1,2})/-/-', s)
-    if m_dmy:
-        a, b, y = m_dmy.groups()
-        a, b = int(a), int(b)
-        mth = a if a <= 12 else b
-        return f"{int(mth):02d}/{y}"
+    # Formato MM/AAAA ou MM-AAAA
+    m_br = re.search(r'(\d{2})[/\-](20\d{2})', s)
+    if m_br:
+        mes, ano = int(m_br.group(1)), int(m_br.group(2))
+        if 1 <= mes <= 12:
+            return _format_competencia_yyyy_mm(ano, mes)
 
-    # Ex.: 06/2025
-    m_my = re.search(r'(0?[1-9]|1[0-2])/-', s)
-    if m_my:
-        mth, y = m_my.groups()
-        return f"{int(mth):02d}/{y}"
+    return None
 
-    return s or ""
 
 def remover_segundos_colunas(df: pd.DataFrame, colunas, formato: str = "%Y-%m-%d %H:%M") -> pd.DataFrame:
     df = df.copy()
@@ -1031,6 +1017,20 @@ if enriquecer:
             # Carrega os arquivos
             df_rel_comum = carregar_excel(relatorio_ambos_file)
             df_balancete = carregar_excel(balancete_file)
+            
+            # --- Adicionando protocolos e competência do balancete no arquivo "ambos" ---
+
+            # Seleciona apenas as colunas de interesse do balancete
+            df_balancete_reduzido = df_balancete[["CNPJ", "protocolo", "competencia"]].drop_duplicates()
+
+            # Faz o merge com base no CNPJ
+            df_ambos_final = df_ambos.merge(df_balancete_reduzido, on="CNPJ", how="left")
+
+            # Salva o resultado
+            df_ambos_final.to_excel("ambos_com_protocolo_competencia.xlsx", index=False)
+
+            st.success("Arquivo 'ambos_com_protocolo_competencia.xlsx' gerado com sucesso!")
+
 
             # Padroniza colunas
             df_rel_comum = padronizar_colunas(df_rel_comum)
