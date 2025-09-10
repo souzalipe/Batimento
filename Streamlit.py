@@ -320,17 +320,22 @@ EXCLUIR_SITUACAO_CONTROLE = ("I", "P")
 
 def filtrar_controle_por_situacao(df: pd.DataFrame,
                                   excluir_codigos=EXCLUIR_SITUACAO_CONTROLE) -> pd.DataFrame:
-    if df is None or df is empty:
+    if df is None or df.empty:   # ✅ corrigido
         return df
+
     col_status = _encontrar_coluna_status(df)
     if not col_status or col_status not in df.columns:
         return df
+
     excluir_norm = {normaliza_texto(x)[:1] for x in excluir_codigos}
     out = df.copy()
-    out["_SIT_"] = out[col_status].map(lambda x: normaliza_texto(x)[:1] if pd.notna(x) else "")
+    out["_SIT_"] = out[col_status].map(
+        lambda x: normaliza_texto(x)[:1] if pd.notna(x) else ""
+    )
     mask_excluir = out["_SIT_"].isin(excluir_norm)
     out = out[~mask_excluir].drop(columns=["_SIT_"])
     return out
+
 
 def carregar_controle(df_controle):
     if "CNPJ" not in df_controle.columns:
@@ -576,57 +581,97 @@ def _extrair_mm_yyyy_de_nome_arquivo(linhas: list[str]) -> Optional[str]:
 
 def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
     linhas = _linhas_excel_como_texto(arquivo_excel)
-    atual_comp = _extrair_mm_yyyy_de_nome_arquivo(linhas)
     registros = []
-    def _tenta_pegar_competencia(idx):
-        if idx + 1 < len(linhas):
-            raw = linhas[idx+1]
-            m = re.search(r"(\d{2})/(\d{2})/(\d{4})", raw)
-            if m:
-                a, b, y = m.groups()
-                mm = a
-                return f"{mm}/{y}"
-        return None
+    n = len(linhas)
     i = 0
-    while i < len(linhas):
-        s = linhas[i].upper()
-        if s.startswith("COMPETÊNCIA"):
-            if not atual_comp:
-                comp_try = _tenta_pegar_competencia(i)
-                if comp_try:
-                    atual_comp = comp_try
-        elif s.startswith("PARTICIPANTE"):
+
+    while i < n:
+        s = linhas[i].strip().upper()
+        if s.startswith("PARTICIPANTE"):
+            # procura CNPJ logo abaixo do "Participante:"
+            j = i
             cnpj_fmt = None
-            for j in range(i+1, min(i+6, len(linhas))):
-                m = re.search(r"\((\d{2}\.\d{3}\.\d{3}/\d{4}\-\d{2})\)", linhas[j])
+            for j in range(i+1, min(i+8, n)):
+                m = re.search(r"\((\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\)", linhas[j])
                 if m:
                     cnpj_fmt = m.group(1)
                     break
-            cnpj_norm = normaliza_cnpj(cnpj_fmt) if cnpj_fmt else None
+            cnpj_num = normaliza_cnpj(cnpj_fmt) if cnpj_fmt else None
+
+            # janela de busca ao redor do bloco (antes e depois) para protocolo/competência
+            ws = max(0, i-15)
+            we = min(n, i+15)
+            window = linhas[ws:we]
+
             protocolo = None
-            k = j if cnpj_fmt else i+1
-            while k < len(linhas) and protocolo is None:
-                if linhas[k].upper().startswith("Nº PROTOCOLO") or linhas[k].upper().startswith("Nº DO PROTOCOLO") or linhas[k].upper().startswith("NUMERO DO PROTOCOLO"):
-                    if k + 1 < len(linhas):
-                        protocolo = linhas[k+1].strip()
+            # 1) procura "Nº Protocolo: XXXX" inline (alfa-numérico)
+            for idx, txt in enumerate(window):
+                m_inline = re.search(r"N[\sº°oO]*\s*PROTOCOLO[:\-\s]*([A-Z0-9\-]{4,30})", txt, flags=re.I)
+                if m_inline:
+                    protocolo = m_inline.group(1).strip()
                     break
-                if "PROTOCOLO DE CONFIRMA" in linhas[k].upper() or linhas[k].upper().startswith("PARTICIPANTE"):
-                    break
-                k += 1
-            if cnpj_norm:
+
+            # 2) se não achou, procura linha contendo "PROTOCOLO" e pega próxima linha como token
+            if not protocolo:
+                for idx, txt in enumerate(window):
+                    if re.search(r"N[\sº°oO]*\s*PROTOCOLO", txt, flags=re.I):
+                        if idx + 1 < len(window):
+                            cand = window[idx+1].strip()
+                            m_cand = re.search(r"([A-Z0-9\-]{4,30})", cand, flags=re.I)
+                            if m_cand:
+                                protocolo = m_cand.group(1).strip()
+                                break
+
+            # 3) fallback: achar qualquer token alfanumérico razoável próximo (evita datas/CNPJs)
+            if not protocolo:
+                for idx in range(ws, we):
+                    m_any = re.search(r"\b([A-Z0-9]{6,20})\b", linhas[idx], flags=re.I)
+                    if m_any:
+                        tok = m_any.group(1)
+                        if not re.match(r"\d{2}/\d{4}", tok) and not re.match(r"\d{2}/\d{2}/\d{4}", tok):
+                            protocolo = tok
+                            break
+
+            # --- Competência: procura dd/mm/yyyy (preferível) ou mm/yyyy no mesmo bloco
+            competencia = None
+            best = None  # (dist, matchobj)
+            for idx_off, txt in enumerate(window):
+                m1 = re.search(r"(\d{2})/(\d{2})/(\d{4})", txt)
+                if m1:
+                    abspos = ws + idx_off
+                    dist = abs(abspos - i)
+                    if best is None or dist < best[0]:
+                        best = (dist, m1)
+            if best:
+                m = best[1]
+                competencia = f"{m.group(2)}/{m.group(3)}"  # MM/AAAA
+            else:
+                # procura mm/yyyy
+                for txt in window:
+                    m2 = re.search(r"\b(\d{2})/(\d{4})\b", txt)
+                    if m2:
+                        competencia = f"{m2.group(1)}/{m2.group(2)}"
+                        break
+
+            if cnpj_num:
                 registros.append({
-                    "CNPJ": formatar_cnpj(cnpj_norm),
+                    "CNPJ": formatar_cnpj(cnpj_num),
                     "Balancete_Protocolo": protocolo or "",
-                    "Balancete_Competencia": atual_comp or ""
+                    "Balancete_Competencia": competencia or ""
                 })
-            i = max(i+1, k+1 if protocolo else i+1)
+
+            # avança o índice para sair do bloco (se achou j, vai pra depois dele)
+            i = (j + 1) if j and (j + 1) > i else i + 1
             continue
+
         i += 1
+
     if not registros:
         return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"])
-    df = pd.DataFrame(registros)
-    df = df.drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
+
+    df = pd.DataFrame(registros).drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
     return df
+
 
 def parse_protocolo_balancete_from_pdf(uploaded_pdf) -> pd.DataFrame:
     text = _read_text_from_pdf(uploaded_pdf)
@@ -794,7 +839,7 @@ with colb1:
     relatorio_ambos_file = st.file_uploader("Arquivo Relatório de Ambos (.xlsx)", type=["xlsx"], key="relatorio_ambos")
 with colb2:
     balancete_file = st.file_uploader(
-        "Arquivo de Balancete (XLSX ou PDF) — arquivo de PROTOCOLOS da CVM",
+        "Arquivo de Balancete (XLSX ou PDF)",
         type=["xlsx", "pdf"],
         accept_multiple_files=False
     )
