@@ -1,7 +1,17 @@
-NameError: name 'empty' is not defined
-Traceback:
-File "C:\Users\T1092497\OneDrive - Banco do Brasil S.A\Documentos\Projetos\filtragem\app.py", line 696, in <module>
-    df_controle_fora = filtrar_controle_por_situacao(df_controle_fora)
-File "C:\Users\T1092497\OneDrive - Banco do Brasil S.A\Documentos\Projetos\filtragem\app.py", line 323, in filtrar_controle_por_situacao
-    if df is None or df is empty:
-      
+def filtrar_controle_por_situacao(df: pd.DataFrame,
+                                  excluir_codigos=EXCLUIR_SITUACAO_CONTROLE) -> pd.DataFrame:
+    if df is None or df.empty:   # ✅ corrigido
+        return df
+
+    col_status = _encontrar_coluna_status(df)
+    if not col_status or col_status not in df.columns:
+        return df
+
+    excluir_norm = {normaliza_texto(x)[:1] for x in excluir_codigos}
+    out = df.copy()
+    out["_SIT_"] = out[col_status].map(
+        lambda x: normaliza_texto(x)[:1] if pd.notna(x) else ""
+    )
+    mask_excluir = out["_SIT_"].isin(excluir_norm)
+    out = out[~mask_excluir].drop(columns=["_SIT_"])
+    return out
