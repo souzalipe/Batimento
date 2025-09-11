@@ -26,14 +26,15 @@ def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
                 if cnpj_fmt:
                     break
 
-            # procurar protocolo nas proximidades
+            # procurar protocolo nas proximidades (antes/depois do participante)
             protocolo = None
-            for rr in range(max(0, r-10), min(len(df_raw), r+10)):
-                row_vals = df_raw.iloc[rr].astype(str).tolist()
-                for cell in row_vals:
-                    m_proto = re.search(r"N[º°]?\s*PROTOCOLO[:\-\s]*([A-Z0-9\-]{4,30})", str(cell), flags=re.I)
-                    if m_proto:
-                        protocolo = m_proto.group(1).strip()
+            for rr in range(max(0, r-15), r+15):
+                row_vals = df_raw.iloc[rr].tolist()
+                for cc, cell in enumerate(row_vals):
+                    if isinstance(cell, str) and cell.strip().upper().startswith("Nº PROTOCOLO"):
+                        # pega célula vizinha
+                        if cc + 1 < len(row_vals):
+                            protocolo = str(row_vals[cc+1]).strip()
                         break
                 if protocolo:
                     break
@@ -44,15 +45,8 @@ def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
                 row_vals = df_raw.iloc[rr].tolist()
                 for cc, cell in enumerate(row_vals):
                     if isinstance(cell, str) and cell.strip().upper().startswith("COMPETÊNCIA"):
-                        # pega a célula vizinha (mesma linha, próxima coluna)
                         if cc + 1 < len(row_vals):
-                            competencia_raw = str(row_vals[cc+1]).strip()
-                            # tenta normalizar
-                            m = re.search(r"(\d{4})-(\d{2})", competencia_raw)
-                            if m:
-                                competencia = f"{m.group(2)}/{m.group(1)}"
-                            else:
-                                competencia = competencia_raw
+                            competencia = str(row_vals[cc+1]).strip()
                         break
                 if competencia:
                     break
