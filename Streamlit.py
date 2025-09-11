@@ -1,71 +1,62 @@
 def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
-    linhas = _linhas_excel_como_texto(arquivo_excel)
+    df_raw = pd.read_excel(arquivo_excel, sheet_name=0, header=None, dtype=str)
+    linhas = []
+    for r, row in df_raw.iterrows():
+        for c, val in enumerate(row):
+            if pd.notna(val) and str(val).strip():
+                linhas.append((r, c, str(val).strip()))
+
     registros = []
-    n = len(linhas)
-    i = 0
+    for i, (r, c, txt) in enumerate(linhas):
+        txt_up = txt.strip().upper()
 
-    while i < n:
-        s = linhas[i].strip().upper()
-        if s.startswith("PARTICIPANTE"):
-            # procura CNPJ logo abaixo do "Participante:"
-            j = i
-            cnpj_fmt = None
-            for j in range(i + 1, min(i + 8, n)):
-                m = re.search(r"\((\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\)", linhas[j])
-                if m:
-                    cnpj_fmt = m.group(1)
-                    break
-            cnpj_num = normaliza_cnpj(cnpj_fmt) if cnpj_fmt else None
+        # Se for PARTICIPANTE, tenta capturar o CNPJ e os dados relacionados
+        if txt_up.startswith("PARTICIPANTE"):
+            cnpj_fmt, cnpj_num = None, None
 
-            # janela: só linhas ANTES do Participante (até 15 acima)
-            ws = max(0, i - 15)
-            window = linhas[ws:i]
-
-            # --- Competência: procurar explicitamente "Competência:"
-            competencia_raw = None
-            for txt in reversed(window):  # de baixo pra cima (linha mais próxima do Participante tem prioridade)
-                m = re.search(r"COMPET[ÊE]NCIA\s*:\s*(.+)", txt, flags=re.I)
-                if m:
-                    competencia_raw = m.group(1).strip()
+            # procurar CNPJ logo abaixo
+            for rr in range(r, r+6):
+                row_vals = df_raw.iloc[rr].astype(str).tolist()
+                for cell in row_vals:
+                    m = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", str(cell))
+                    if m:
+                        cnpj_fmt = m.group(1)
+                        cnpj_num = normaliza_cnpj(cnpj_fmt)
+                        break
+                if cnpj_fmt:
                     break
 
-            competencia = _normalize_competencia_to_mm_yyyy(competencia_raw)
-
-            # --- Protocolo (mantida a lógica atual)
-            ws = max(0, i - 15)
-            we = min(n, i + 15)
-            window = linhas[ws:we]
-
+            # procurar protocolo nas proximidades
             protocolo = None
-            # 1) procura "Nº Protocolo: XXXX" inline
-            for idx, txt in enumerate(window):
-                m_inline = re.search(r"N[\sº°oO]*\s*PROTOCOLO[:\-\s]*([A-Z0-9\-]{4,60})", txt, flags=re.I)
-                if m_inline:
-                    protocolo = m_inline.group(1).strip()
+            for rr in range(max(0, r-10), min(len(df_raw), r+10)):
+                row_vals = df_raw.iloc[rr].astype(str).tolist()
+                for cell in row_vals:
+                    m_proto = re.search(r"N[º°]?\s*PROTOCOLO[:\-\s]*([A-Z0-9\-]{4,30})", str(cell), flags=re.I)
+                    if m_proto:
+                        protocolo = m_proto.group(1).strip()
+                        break
+                if protocolo:
                     break
 
-            # 2) se não achou, procura linha com "PROTOCOLO" e pega a próxima
-            if not protocolo:
-                for idx, txt in enumerate(window):
-                    if re.search(r"N[\sº°oO]*\s*PROTOCOLO", txt, flags=re.I):
-                        if idx + 1 < len(window):
-                            cand = window[idx + 1].strip()
-                            m_cand = re.search(r"([A-Z0-9\-]{4,60})", cand, flags=re.I)
-                            if m_cand:
-                                protocolo = m_cand.group(1).strip()
-                                break
+            # procurar competência ANTES do participante
+            competencia = None
+            for rr in range(max(0, r-15), r+1):
+                row_vals = df_raw.iloc[rr].tolist()
+                for cc, cell in enumerate(row_vals):
+                    if isinstance(cell, str) and cell.strip().upper().startswith("COMPETÊNCIA"):
+                        # pega a célula vizinha (mesma linha, próxima coluna)
+                        if cc + 1 < len(row_vals):
+                            competencia_raw = str(row_vals[cc+1]).strip()
+                            # tenta normalizar
+                            m = re.search(r"(\d{4})-(\d{2})", competencia_raw)
+                            if m:
+                                competencia = f"{m.group(2)}/{m.group(1)}"
+                            else:
+                                competencia = competencia_raw
+                        break
+                if competencia:
+                    break
 
-            # 3) fallback: token alfanumérico próximo
-            if not protocolo:
-                for idx in range(ws, we):
-                    m_any = re.search(r"\b([A-Z0-9]{6,60})\b", linhas[idx], flags=re.I)
-                    if m_any:
-                        tok = m_any.group(1)
-                        if not re.match(r"\d{2}/\d{4}", tok) and not re.match(r"\d{2}/\d{2}/\d{4}", tok):
-                            protocolo = tok
-                            break
-
-            # grava o registro (se achou CNPJ)
             if cnpj_num:
                 registros.append({
                     "CNPJ": formatar_cnpj(cnpj_num),
@@ -73,15 +64,8 @@ def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
                     "Balancete_Competencia": competencia or ""
                 })
 
-            # avança pra depois do bloco do participante
-            i = (j + 1) if j and (j + 1) > i else i + 1
-            continue
-
-        i += 1
-
     if not registros:
         return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"])
 
     df = pd.DataFrame(registros).drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
     return df
-
