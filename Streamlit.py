@@ -1,5 +1,3 @@
-# Substitua o conteúdo do seu Streamlit (5).py por este código completo
-
 import io
 import re
 import unicodedata
@@ -836,7 +834,7 @@ if bt_cda:
 st.markdown("## 🔄 3° - Enriquecer batimento com Balancete")
 colb1, colb2 = st.columns(2)
 with colb1:
-    relatorio_ambos_file = st.file_uploader("Arquivo Relatório de Ambos (.xlsx)", type=["xlsx"], key="relatorio_ambos")
+    relatorio_ambos_file = st.file_uploader("Arquivo Relatório de Ambos com CDA (.xlsx)", type=["xlsx"], key="relatorio_ambos")
 with colb2:
     balancete_file = st.file_uploader(
         "Arquivo de Balancete (XLSX ou PDF)",
