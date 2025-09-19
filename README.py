@@ -1,16 +1,18 @@
-# supondo que seu arquivo de balancete seja 'balancete_file' (XLSX ou PDF)
-# e que parse_protocolo_balancete / parse_protocolo_balancete_from_pdf
-# estejam definidos conforme o seu CVM.py
-
-# Ajuste o nome do uploaded_file abaixo ao rodar localmente
-df_proto = parse_protocolo_balancete(balancete_file)  # se for xlsx
-# df_proto = parse_protocolo_balancete_from_pdf(balancete_file)  # se for pdf
-
-print("linhas extraídas pelo parser:", len(df_proto))
-print(df_proto.head(20))
-print("contagem CNPJ nulos:", df_proto["CNPJ"].isnull().sum() if "CNPJ" in df_proto.columns else "col CNPJ ausente")
-print("contagem protocolos nulos:", df_proto["Balancete_Protocolo"].isnull().sum() if "Balancete_Protocolo" in df_proto.columns else "col Balancete_Protocolo ausente")
-print("exemplos protocolos encontrados (value_counts):")
-print(df_proto["Balancete_Protocolo"].value_counts(dropna=False).head(30))
-
-
+# --- captura CNPJ dentro do bloco (primeiro que aparecer)  (substituir o bloco atual) ---
+cnpj_fmt = None
+for rr in range(r, limite):
+    for cell2 in df_raw.iloc[rr].astype(str).tolist():
+        txt = str(cell2 or "")
+        # 1) formato com pontuação
+        m = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", txt)
+        if m:
+            cnpj_fmt = m.group(1)
+            break
+        # 2) ou 14 dígitos seguidos (sem pontuação) -> formata
+        digits = re.sub(r"\D", "", txt)
+        if len(digits) == 14:
+            cnpj_fmt = f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+            break
+    if cnpj_fmt:
+        break
+cnpj_num = normaliza_cnpj(cnpj_fmt) if cnpj_fmt else None
