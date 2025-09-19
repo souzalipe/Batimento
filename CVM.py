@@ -603,93 +603,136 @@ def enriquecer_em_comum_com_cda(rel_em_comum_df: pd.DataFrame, df_cda: pd.DataFr
 
 # --- Substitua sua parse_protocolo_balancete por esta (XLSX)
 def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
+    """
+    Extração robusta do Nº do Protocolo do Balancete por bloco 'Participante'.
+    Regras:
+    - bloco = da linha do 'Participante' até próxima ocorrência de 'Participante' ou +60 linhas
+    - procura rótulos contendo 'PROTOCOLO' (não ancorado)
+      -> checa mesma linha: próximas 1..3 células à direita
+      -> checa linha abaixo: mesma coluna
+    - fallback: primeiro 'SCW\d{6,}' dentro do bloco (pra frente)
+    - detecção simples de ETF: se houver 'ETF' no bloco, marca "Não possui"
+    - retorna DataFrame com colunas: CNPJ, Balancete_Protocolo, Balancete_Competencia
+    """
     df_raw = pd.read_excel(arquivo_excel, sheet_name=0, header=None, dtype=str)
-    linhas = []
-    for r, row in df_raw.iterrows():
-        for c, val in enumerate(row):
-            if pd.notna(val) and str(val).strip():
-                linhas.append((r, c, str(val).strip()))
-
     registros = []
-    for i, (r, c, txt) in enumerate(linhas):
-        txt_up = txt.strip().upper()
+    upper = df_raw.shape[0]
+    ncols = df_raw.shape[1] if df_raw.shape[1] > 0 else 0
 
-        # Se for PARTICIPANTE, tenta capturar o CNPJ e os dados relacionados
-        if txt_up.startswith("PARTICIPANTE"):
-            cnpj_fmt, cnpj_num = None, None
-
-            # procurar CNPJ logo abaixo
-            for rr in range(r, r+6):
-                row_vals = df_raw.iloc[rr].astype(str).tolist()
-                for cell in row_vals:
-                    m = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", str(cell))
-                    if m:
-                        cnpj_fmt = m.group(1)
-                        cnpj_num = normaliza_cnpj(cnpj_fmt)
+    for r in range(upper):
+        row_vals = df_raw.iloc[r].astype(str).tolist()
+        for c, cell in enumerate(row_vals):
+            if not isinstance(cell, str):
+                continue
+            if cell.strip().upper().startswith("PARTICIPANTE"):
+                # define limite do bloco: próximo 'PARTICIPANTE' ou +60 linhas
+                limite = min(r + 60, upper)
+                for rr2 in range(r + 1, min(upper, r + 61)):
+                    line_vals = df_raw.iloc[rr2].astype(str).tolist()
+                    if any('PARTICIPANTE' in str(x).strip().upper() for x in line_vals):
+                        limite = rr2
                         break
-                if cnpj_fmt:
-                    break
 
-            # procurar protocolo nas proximidades (antes/depois do participante)
-            # Procurar protocolo APENAS DEPOIS do 'Participante' (faixa pequena)
-            protocolo = None
-            upper = df_raw.shape[0]
-            for rr in range(r, min(r + 20, upper)):  # só para frente (até 20 linhas)
-                row_vals = df_raw.iloc[rr].astype(str).tolist()
-                for cc, cell in enumerate(row_vals):
-                    lab = str(cell).strip().upper()
+                # captura CNPJ dentro do bloco (primeiro que aparecer)
+                cnpj_fmt = None
+                for rr in range(r, limite):
+                    for cell2 in df_raw.iloc[rr].astype(str).tolist():
+                        m = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", str(cell2))
+                        if m:
+                            cnpj_fmt = m.group(1)
+                            break
+                    if cnpj_fmt:
+                        break
+                cnpj_num = normaliza_cnpj(cnpj_fmt) if cnpj_fmt else None
 
-                    # cobre variações de rótulo: "Nº Protocolo", "N° Protocolo", "No Protocolo", "Nº do Protocolo", etc.
-                    # 1) forma mais específica por regex:
-                    if re.search(r'^N[º°O]?\\s*(DO\\s*)?PROTOCOLO:?$', lab):
-                        # valor geralmente está na célula seguinte (mesma linha)
-                        if cc + 1 < len(row_vals):
-                            cand = str(row_vals[cc + 1]).strip()
-                            if re.match(r'^SCW\\d{6,}$', cand):  # valida formato SCW******
-                                protocolo = cand
+                # detecta ETF simples (se houver a palavra ETF no bloco)
+                is_etf = False
+                for rr in range(r, limite):
+                    if any(re.search(r'\bETF\b', str(x), flags=re.I) for x in df_raw.iloc[rr].astype(str).tolist()):
+                        is_etf = True
+                        break
+
+                protocolo = None
+
+                if is_etf:
+                    protocolo = "Não possui"
+                else:
+                    # 1) heurística rótulo -> valor (varre só para frente dentro do bloco)
+                    encontrado = False
+                    for rr in range(r, limite):
+                        row_vals2 = df_raw.iloc[rr].astype(str).tolist()
+                        for cc, cell2 in enumerate(row_vals2):
+                            lab = str(cell2).strip().upper()
+                            if 'PROTOCOLO' in lab:
+                                # mesma linha: checa até +3 células à direita
+                                for k in range(cc + 1, min(cc + 4, len(row_vals2))):
+                                    try:
+                                        cand_cell = row_vals2[k]
+                                    except Exception:
+                                        cand_cell = ""
+                                    m = re.search(r'(SCW\d{6,})', str(cand_cell), flags=re.I)
+                                    if m:
+                                        protocolo = m.group(1).upper()
+                                        encontrado = True
+                                        break
+                                if encontrado:
+                                    break
+                                # linha de baixo: mesma coluna
+                                if rr + 1 < upper and cc < ncols:
+                                    try:
+                                        below = df_raw.iat[rr + 1, cc]
+                                    except Exception:
+                                        below = ""
+                                    m = re.search(r'(SCW\d{6,})', str(below), flags=re.I)
+                                    if m:
+                                        protocolo = m.group(1).upper()
+                                        encontrado = True
+                                        break
+                        if encontrado:
+                            break
+
+                    # 2) fallback: primeiro SCW dentro do bloco (pra frente)
+                    if not protocolo:
+                        for rr in range(r, limite):
+                            for cell2 in df_raw.iloc[rr].astype(str).tolist():
+                                m = re.search(r'(SCW\d{6,})', str(cell2), flags=re.I)
+                                if m:
+                                    protocolo = m.group(1).upper()
+                                    break
+                            if protocolo:
                                 break
 
-                    # 2) fallback simples: se a célula indica "PROTOCOLO" e tem um "N", aceita como rótulo
-                    elif ("PROTOCOLO" in lab) and ("N" in lab):
-                        if cc + 1 < len(row_vals):
-                            cand = str(row_vals[cc + 1]).strip()
-                            if re.match(r'^SCW\\d{6,}$', cand):
-                                protocolo = cand
-                                break
-
-                    # 3) fallback extra: se por acaso o SCW estiver na própria célula
-                    if re.match(r'^SCW\\d{6,}$', lab):
-                        protocolo = lab
+                # captura competência (procura para trás até 15 linhas)
+                competencia = None
+                for rr in range(max(0, r - 15), r + 1):
+                    row_vals3 = df_raw.iloc[rr].astype(str).tolist()
+                    for cc, cell3 in enumerate(row_vals3):
+                        if isinstance(cell3, str) and 'COMPET' in cell3.strip().upper():
+                            # tenta célula à direita imediata
+                            val = None
+                            if cc + 1 < len(row_vals3) and str(row_vals3[cc + 1]).strip():
+                                val = row_vals3[cc + 1]
+                            else:
+                                # tenta na linha de baixo mesma coluna (até 3 linhas)
+                                for kk in range(rr + 1, min(rr + 4, upper)):
+                                    if cc < df_raw.shape[1]:
+                                        v = df_raw.iat[kk, cc]
+                                        if pd.notna(v) and str(v).strip():
+                                            val = v
+                                            break
+                            if val:
+                                try:
+                                    # tenta normalizar para YYYY-MM (compatível com outras funções do script)
+                                    comp_norm = _normaliza_competencia_mm_aaaa(str(val).strip())
+                                    competencia = comp_norm or str(val).strip()
+                                except Exception:
+                                    competencia = str(val).strip()
+                            break
+                    if competencia:
                         break
 
-                if protocolo:
-                    break
-
-
-            # procurar competência ANTES do participante
-            competencia = None
-            for rr in range(max(0, r-15), r+1):
-                row_vals = df_raw.iloc[rr].tolist()
-                for cc, cell in enumerate(row_vals):
-                    if isinstance(cell, str) and cell.strip().upper().startswith("COMPETÊNCIA"):
-                        if cc + 1 < len(row_vals):
-                            competencia_raw = row_vals[cc+1]
-                            # se for data do Excel, converte
-                            try:
-                                comp_date = pd.to_datetime(competencia_raw, errors="coerce")
-                                if pd.notna(comp_date):
-                                    competencia = f"{comp_date.month:02d}/{comp_date.year}"
-                                else:
-                                    competencia = str(competencia_raw).strip()
-                            except Exception:
-                                competencia = str(competencia_raw).strip()
-                        break
-                if competencia:
-                    break
-
-            if cnpj_num:
                 registros.append({
-                    "CNPJ": formatar_cnpj(cnpj_num),
+                    "CNPJ": formatar_cnpj(cnpj_num) if cnpj_num else None,
                     "Balancete_Protocolo": protocolo or "",
                     "Balancete_Competencia": competencia or ""
                 })
@@ -699,6 +742,7 @@ def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
 
     df = pd.DataFrame(registros).drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
     return df
+
 
 
 def parse_protocolo_balancete_from_pdf(uploaded_pdf) -> pd.DataFrame:
