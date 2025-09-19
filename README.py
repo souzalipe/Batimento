@@ -129,4 +129,3 @@ assert extrair_protocolo(df_raw, linha_participante_ETF) in (None, "Não possui"
 
 ---
 
-Se você quiser, eu também te preparo uma versão com **logs de depuração** (ex.: `print`/`logger.debug` com a linha/coluna analisada) para facilitar ajuste fino quando aparecer um layout diferente. Quer?
