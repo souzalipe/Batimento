@@ -1,131 +1,140 @@
+def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
+    """
+    Extração robusta do Nº do Protocolo do Balancete por bloco 'Participante'.
+    Regras:
+    - bloco = da linha do 'Participante' até próxima ocorrência de 'Participante' ou +60 linhas
+    - procura rótulos contendo 'PROTOCOLO' (não ancorado)
+      -> checa mesma linha: próximas 1..3 células à direita
+      -> checa linha abaixo: mesma coluna
+    - fallback: primeiro 'SCW\d{6,}' dentro do bloco (pra frente)
+    - detecção simples de ETF: se houver 'ETF' no bloco, marca "Não possui"
+    - retorna DataFrame com colunas: CNPJ, Balancete_Protocolo, Balancete_Competencia
+    """
+    df_raw = pd.read_excel(arquivo_excel, sheet_name=0, header=None, dtype=str)
+    registros = []
+    upper = df_raw.shape[0]
+    ncols = df_raw.shape[1] if df_raw.shape[1] > 0 else 0
 
+    for r in range(upper):
+        row_vals = df_raw.iloc[r].astype(str).tolist()
+        for c, cell in enumerate(row_vals):
+            if not isinstance(cell, str):
+                continue
+            if cell.strip().upper().startswith("PARTICIPANTE"):
+                # define limite do bloco: próximo 'PARTICIPANTE' ou +60 linhas
+                limite = min(r + 60, upper)
+                for rr2 in range(r + 1, min(upper, r + 61)):
+                    line_vals = df_raw.iloc[rr2].astype(str).tolist()
+                    if any('PARTICIPANTE' in str(x).strip().upper() for x in line_vals):
+                        limite = rr2
+                        break
 
----
+                # captura CNPJ dentro do bloco (primeiro que aparecer)
+                cnpj_fmt = None
+                for rr in range(r, limite):
+                    for cell2 in df_raw.iloc[rr].astype(str).tolist():
+                        m = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", str(cell2))
+                        if m:
+                            cnpj_fmt = m.group(1)
+                            break
+                    if cnpj_fmt:
+                        break
+                cnpj_num = normaliza_cnpj(cnpj_fmt) if cnpj_fmt else None
 
-# Explicação da situação (Balancete_Protocolo)
+                # detecta ETF simples (se houver a palavra ETF no bloco)
+                is_etf = False
+                for rr in range(r, limite):
+                    if any(re.search(r'\bETF\b', str(x), flags=re.I) for x in df_raw.iloc[rr].astype(str).tolist()):
+                        is_etf = True
+                        break
 
-## 1) Objetivo
-Extrair corretamente o **Nº do Protocolo do Balancete** (formato `SCW\d+`) para cada **bloco de Participante** no relatório de Balancete e preencher a coluna `Balancete_Protocolo` no dataset final, casando por **CNPJ**.
+                protocolo = None
 
-## 2) Sintomas observados
-- **Antes do patch**: a maioria dos protocolos extraídos ficava **deslocada** em relação ao valor correto (padrão “±1” no número do SCW).  
-- **Depois do patch inicial (“só para frente”)**: a coluna `Balancete_Protocolo` passou a sair **vazia** para praticamente todos os fundos (exceto ETFs marcados como “Não possui”).
+                if is_etf:
+                    protocolo = "Não possui"
+                else:
+                    # 1) heurística rótulo -> valor (varre só para frente dentro do bloco)
+                    encontrado = False
+                    for rr in range(r, limite):
+                        row_vals2 = df_raw.iloc[rr].astype(str).tolist()
+                        for cc, cell2 in enumerate(row_vals2):
+                            lab = str(cell2).strip().upper()
+                            if 'PROTOCOLO' in lab:
+                                # mesma linha: checa até +3 células à direita
+                                for k in range(cc + 1, min(cc + 4, len(row_vals2))):
+                                    try:
+                                        cand_cell = row_vals2[k]
+                                    except Exception:
+                                        cand_cell = ""
+                                    m = re.search(r'(SCW\d{6,})', str(cand_cell), flags=re.I)
+                                    if m:
+                                        protocolo = m.group(1).upper()
+                                        encontrado = True
+                                        break
+                                if encontrado:
+                                    break
+                                # linha de baixo: mesma coluna
+                                if rr + 1 < upper and cc < ncols:
+                                    try:
+                                        below = df_raw.iat[rr + 1, cc]
+                                    except Exception:
+                                        below = ""
+                                    m = re.search(r'(SCW\d{6,})', str(below), flags=re.I)
+                                    if m:
+                                        protocolo = m.group(1).upper()
+                                        encontrado = True
+                                        break
+                        if encontrado:
+                            break
 
-## 3) Causa-raiz
-Existem **dois problemas distintos** que explicam os sintomas:
+                    # 2) fallback: primeiro SCW dentro do bloco (pra frente)
+                    if not protocolo:
+                        for rr in range(r, limite):
+                            for cell2 in df_raw.iloc[rr].astype(str).tolist():
+                                m = re.search(r'(SCW\d{6,})', str(cell2), flags=re.I)
+                                if m:
+                                    protocolo = m.group(1).upper()
+                                    break
+                            if protocolo:
+                                break
 
-1. **Deslocamento (antes do patch)**  
-   A busca do protocolo era feita **antes e depois** do “Participante”. Como os blocos são sequenciais, vasculhar **para trás** acabava pegando o protocolo do **bloco anterior**.
+                # captura competência (procura para trás até 15 linhas)
+                competencia = None
+                for rr in range(max(0, r - 15), r + 1):
+                    row_vals3 = df_raw.iloc[rr].astype(str).tolist()
+                    for cc, cell3 in enumerate(row_vals3):
+                        if isinstance(cell3, str) and 'COMPET' in cell3.strip().upper():
+                            # tenta célula à direita imediata
+                            val = None
+                            if cc + 1 < len(row_vals3) and str(row_vals3[cc + 1]).strip():
+                                val = row_vals3[cc + 1]
+                            else:
+                                # tenta na linha de baixo mesma coluna (até 3 linhas)
+                                for kk in range(rr + 1, min(rr + 4, upper)):
+                                    if cc < df_raw.shape[1]:
+                                        v = df_raw.iat[kk, cc]
+                                        if pd.notna(v) and str(v).strip():
+                                            val = v
+                                            break
+                            if val:
+                                try:
+                                    # tenta normalizar para YYYY-MM (compatível com outras funções do script)
+                                    comp_norm = _normaliza_competencia_mm_aaaa(str(val).strip())
+                                    competencia = comp_norm or str(val).strip()
+                                except Exception:
+                                    competencia = str(val).strip()
+                            break
+                    if competencia:
+                        break
 
-2. **Campos vazios (depois do patch)**  
-   O patch “só para frente” foi correto na direção, mas a extração ficou **restritiva** demais:
-   - Regex do rótulo **ancorada** (ex.: `^N[º°O]?\s*(DO\s*)?PROTOCOLO:?$`) falha quando o rótulo tem **texto residual** (ex.: “Protocolo do Balancete”, “Nº Protocolo :” etc.).
-   - Suposição de que o valor está **sempre na célula imediatamente à direita**; em alguns layouts vem **duas colunas à direita** ou **na linha de baixo**.
-   - Uso de `re.match` em vez de `re.search` para capturar o `SCW` quando há outros caracteres na célula.
+                registros.append({
+                    "CNPJ": formatar_cnpj(cnpj_num) if cnpj_num else None,
+                    "Balancete_Protocolo": protocolo or "",
+                    "Balancete_Competencia": competencia or ""
+                })
 
-## 4) Regras de negócio relevantes
-- **Escopo do bloco**: tudo que está entre a célula que contém “**Participante**” do fundo atual **e** a próxima ocorrência de “Participante” (ou um limite de linhas) pertence ao **mesmo fundo**.
-- **CNPJ** é capturado **nesse bloco** e o protocolo **deve** sair do mesmo bloco.
-- **ETFs**: podem não ter protocolo de Balancete; nesses casos, `Balancete_Protocolo = "Não possui"`.
-- **Competência do Balancete** (se já está correta no código) **não** deve ser alterada por este patch.
+    if not registros:
+        return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"])
 
-## 5) Solução (algoritmo robusto)
-1. Após detectar o **“Participante”** e capturar o **CNPJ**, defina o **limite do bloco**: até a próxima linha que contenha “Participante” **ou** um teto de +60 linhas (o que ocorrer primeiro).  
-2. **Tente primeiro via rótulo → valor**:  
-   - Procure qualquer célula que **contenha** a palavra “PROTOCOLO” (não ancorar; não exigir “Nº”).  
-   - Ao encontrar o rótulo, busque um `SCW\d{6,}`:
-     - **na mesma linha**, nas próximas **1 a 3** células à direita;  
-     - **na linha seguinte**, na **mesma coluna** do rótulo.  
-3. **Fallback**: se não achar nessa heurística, capture o **primeiro `SCW\d{6,}`** que aparecer **em qualquer célula** dentro do bloco (antes do próximo “Participante”).  
-4. **Valide** com regex `r'(SCW\d{6,})'` usando `re.search` (não `match`).  
-5. **Pare** ao encontrar o primeiro protocolo válido para o bloco.
-
-## 6) Bloco de código (para colar no lugar da busca do protocolo)
-> **Observação**: este trecho supõe que você já tem `df_raw` como `DataFrame` (sem cabeçalho), `r` é a linha onde “Participante” foi encontrado, e `re` está importado.
-
-```python
-# --- Captura robusta do Nº do Protocolo (apenas para frente) ---
-protocolo = None
-upper = df_raw.shape[0]
-
-# Define o limite do bloco: até o próximo 'Participante' ou +60 linhas
-limite = min(r + 60, upper)
-for rr2 in range(r + 1, limite):
-    linha = df_raw.iloc[rr2].astype(str).tolist()
-    if any('PARTICIPANTE' in str(x).strip().upper() for x in linha):
-        limite = rr2  # fecha o bloco no início do próximo participante
-        break
-
-# 1) Heurística rótulo -> valor (mesma linha à direita; ou linha de baixo)
-for rr in range(r, limite):
-    row_vals = df_raw.iloc[rr].astype(str).tolist()
-    for cc, cell in enumerate(row_vals):
-        lab = str(cell).strip().upper()
-
-        # Se a célula parece ser o rótulo de protocolo (qualquer variação contendo 'PROTOCOLO')
-        if 'PROTOCOLO' in lab:
-            # mesma linha: checa até +3 células à direita
-            for k in range(cc + 1, min(cc + 4, len(row_vals))):
-                m = re.search(r'(SCW\d{6,})', str(row_vals[k]))
-                if m:
-                    protocolo = m.group(1)
-                    break
-            if protocolo:
-                break
-
-            # linha de baixo: mesma coluna do rótulo
-            if rr + 1 < upper:
-                m = re.search(r'(SCW\d{6,})', str(df_raw.iat[rr + 1, cc]))
-                if m:
-                    protocolo = m.group(1)
-                    break
-    if protocolo:
-        break
-
-# 2) Fallback: primeiro SCW que aparecer no bloco
-if not protocolo:
-    for rr in range(r, limite):
-        row_vals = df_raw.iloc[rr].astype(str).tolist()
-        for cell in row_vals:
-            m = re.search(r'(SCW\d{6,})', str(cell))
-            if m:
-                protocolo = m.group(1)
-                break
-        if protocolo:
-            break
-# --- fim ---
-```
-
-### Por que este bloco funciona
-- **Direção correta** (só para frente): evita capturar o protocolo do bloco anterior.  
-- **Rótulo flexível**: não depende de regex ancorada; cobre “Nº Protocolo”, “Protocolo do Balancete”, variações com “:” ou espaços.  
-- **Posicionamento resiliente**: considera valor **à direita** e **logo abaixo** do rótulo.  
-- **Plano B**: se o layout fugir do padrão, pega o **primeiro SCW** dentro do bloco (que é o desejado).
-
-## 7) Erros comuns a evitar
-- **`re.match`** para achar SCW: use `re.search` (o SCW pode não estar no início da célula).  
-- Rótulo **ancorado** com `^...$`: layouts reais costumam ter texto extra.  
-- Procurar **para trás** do “Participante”: causa o deslocamento “±1”.
-
-## 8) Critérios de aceitação (sem depender de arquivos)
-- Dado um bloco com “Participante …”, **CNPJ** e rótulo contendo “PROTOCOLO”, a função retorna um `SCW\d+` válido.  
-- Quando existir mais de um `SCW` no bloco, retorna o **primeiro** após o rótulo ou, na falta de rótulo, o **primeiro do bloco**.  
-- Para **ETFs**, manter `Balancete_Protocolo = "Não possui"` (ou `None`, conforme regra já existente).  
-- O algoritmo **nunca** retorna o `SCW` do **bloco anterior**.
-
-## 9) Testes (unitários simples, sem arquivos reais)
-Monte `df_raw` mínimo com 2–3 blocos contendo:
-- Variações de rótulo: “Nº Protocolo”, “Protocolo do Balancete:”.  
-- Valor do SCW à direita, 2 células à direita e na linha abaixo.  
-- Um `SCW` residual anterior (para garantir que **não** é capturado).  
-- Um bloco **ETFs** sem protocolo (verificar “Não possui”).
-
-Exemplo de assertiva (pseudocódigo):
-```python
-assert extrair_protocolo(df_raw, linha_participante_A) == "SCW202400123"
-assert extrair_protocolo(df_raw, linha_participante_B) == "SCW202400456"
-assert extrair_protocolo(df_raw, linha_participante_ETF) in (None, "Não possui")
-```
-
----
-
+    df = pd.DataFrame(registros).drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
+    return df
