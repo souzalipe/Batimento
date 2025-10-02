@@ -2,6 +2,7 @@ import io
 import re
 import unicodedata
 from pathlib import Path
+import zipfile
 import pandas as pd
 import streamlit as st
 from typing import Optional, Tuple
@@ -72,6 +73,86 @@ def _normalize_competencia_to_mm_yyyy(raw: Optional[str]) -> Optional[str]:
 
     return None
 
+from typing import Optional
+
+def _encontrar_coluna_drive(df: pd.DataFrame) -> Optional[str]:
+    """
+    Tenta identificar a coluna de Drive no Controle Espelho, 
+    lidando com variações de nome.
+    """
+    if df is None or df.empty:
+        return None
+
+    # Mapa normalizado -> original
+    norm_map = {_norm_header_key(c): c for c in df.columns}
+
+    # Nomes mais comuns
+    preferidos = [
+        "drive", "link_drive", "link_do_drive", "google_drive",
+        "url_drive", "pasta_drive", "pasta", "link", "url"
+    ]
+    for key in preferidos:
+        if key in norm_map:
+            return norm_map[key]
+
+    # Fallback: qualquer coluna que contenha "drive" ou "google"
+    for k, original in norm_map.items():
+        if "drive" in k or "google" in k:
+            return original
+
+    # Última tentativa: alguma coluna "link/url" que não seja óbvia
+    for k, original in norm_map.items():
+        if ("link" in k or "url" in k) and "cnpj" not in k and "nome" not in k:
+            return original
+
+    return None
+
+
+def adicionar_drive_por_cnpj(
+    df_base: pd.DataFrame,
+    controle_df: pd.DataFrame,
+    nome_col_saida: str = "Drive"
+) -> pd.DataFrame:
+    """
+    Anexa a coluna 'Drive' aos relatórios do primeiro batimento.
+    Faz merge por CNPJ com a planilha de Controle (que contém o Drive).
+    Se não encontrar a coluna no Controle, devolve o DF original + coluna vazia.
+    """
+    if df_base is None or df_base.empty:
+        return df_base
+
+    # Garante CNPJ formatado dos dois lados (compatível com seu pipeline)
+    left = df_base.copy()
+    if "CNPJ" in left.columns:
+        left["CNPJ"] = left["CNPJ"].apply(
+            lambda x: formatar_cnpj(normaliza_cnpj(x)) if pd.notna(x) else None
+        )
+
+    right = controle_df.copy()
+    if "CNPJ" in right.columns:
+        right["CNPJ"] = right["CNPJ"].apply(
+            lambda x: formatar_cnpj(normaliza_cnpj(x)) if pd.notna(x) else None
+        )
+
+    col_drive = _encontrar_coluna_drive(right)
+    if not col_drive:
+        # Garante a coluna vazia para não quebrar os downloads
+        out = left.copy()
+        if nome_col_saida not in out.columns:
+            out[nome_col_saida] = ""
+        return out
+
+    mapa = (
+        right[["CNPJ", col_drive]]
+        .rename(columns={col_drive: nome_col_saida})
+        .drop_duplicates(subset="CNPJ", keep="first")
+    )
+
+    out = left.merge(mapa, on="CNPJ", how="left")
+    if nome_col_saida in out.columns:
+        out[nome_col_saida] = out[nome_col_saida].fillna("")
+
+    return out
 
 
 
@@ -465,20 +546,24 @@ def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
             txt = str(val).strip()
             if txt:
                 lines.append((len(lines), txt))
+
     n = len(lines)
     registros = []
     for i in range(n):
         _, text = lines[i]
         low = text.lower()
+
+        # Âncora: "Nº Protocolo"
         if low.startswith('nº protocolo') or low.startswith('n° protocolo') or low.startswith('no protocolo') \
            or low.startswith('nº do protocolo') or low.startswith('n° do protocolo'):
+            # Protocolo (na linha logo abaixo)
             protocolo = None
             j = i + 1
             while j < n:
                 _, t2 = lines[j]
                 low2 = t2.lower()
                 if re.match(
-                    r'^(protocolo de confirm|status:|informe:|opera|documento:|compet|usuário|usuario|nº do recebimento|nome do arquivo|participante:|tipo do participante|data ação:|data acao:)',
+                    r'^(protocolo de confirma|status:|informe:|opera|documento:|compet|usuário|usuario|nº do recebimento|nome do arquivo|participante:|tipo do participante|data ação:|data acao:)',
                     low2
                 ):
                     j += 1
@@ -488,6 +573,8 @@ def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
                     protocolo = protocolo[:-2]
                 break
                 j += 1
+
+            # Participante -> extrair CNPJ (mesma lógica atual)
             cnpj_masked, participante = None, None
             k = i
             while k >= 0:
@@ -499,7 +586,8 @@ def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
                     while kk < n:
                         _, tline = lines[kk]
                         low2 = tline.lower()
-                        if low2.startswith('tipo do participante') or low2.startswith('data ação') or low2.startswith('data acao') or low2.startswith('nº protocolo') or low2.startswith('n° protocolo') or low2.startswith('nº do protocolo') or low2.startswith('n° do protocolo'):
+                        if low2.startswith('tipo do participante') or low2.startswith('data ação') or low2.startswith('data acao') \
+                           or low2.startswith('nº protocolo') or low2.startswith('n° protocolo') or low2.startswith('nº do protocolo') or low2.startswith('n° do protocolo'):
                             break
                         if first_name is None and tline:
                             first_name = tline.strip()
@@ -511,7 +599,10 @@ def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
                     participante = first_name
                     break
                 k -= 1
-            competencia_raw = None
+
+            # Competência (igual ao seu, normalizando)
+            competencia_raw, data_acao_raw = None, None
+
             k = i
             while k >= 0:
                 _, tprev = lines[k]
@@ -526,7 +617,7 @@ def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
                         kk += 1
                     break
                 k -= 1
-            data_acao_raw = None
+
             k = i
             while k >= 0:
                 _, tprev = lines[k]
@@ -541,64 +632,110 @@ def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
                         kk += 1
                     break
                 k -= 1
+
+            # 🔎 Status (NOVO): pegar a linha logo após "Status:"
+            status_txt = None
+            k = i
+            while k >= 0:
+                _, tprev = lines[k]
+                lowp = tprev.lower()
+                if lowp.startswith('status:'):
+                    kk = k + 1
+                    while kk < n:
+                        _, tval = lines[kk]
+                        if tval:
+                            status_txt = tval.strip()
+                            break
+                        kk += 1
+                    break
+                k -= 1
+
             if cnpj_masked and protocolo:
                 cnpj_num = normaliza_cnpj(cnpj_masked)
                 comp = _normaliza_competencia_mm_aaaa(competencia_raw)
+
                 try:
                     data_acao = pd.to_datetime(data_acao_raw, dayfirst=True, errors='coerce') if data_acao_raw else pd.NaT
                 except Exception:
                     data_acao = pd.NaT
+
                 registros.append({
                     "CNPJ_Masked": cnpj_masked,
                     "CNPJ_Num": cnpj_num,
                     "Participante": participante,
                     "CDA_Protocolo": protocolo,
                     "CDA_Competencia": comp,
+                    "CDA_Status": status_txt or "",
                     "Data_Acao": data_acao
                 })
+
     df = pd.DataFrame(registros)
     if df.empty:
         return df
-    df = df.sort_values(["CNPJ_Num", "Data_Acao"], ascending=[True, False]).drop_duplicates("CNPJ_Num", keep="first")
+
+    # Mantém a lógica: um por CNPJ, priorizando Data_Acao mais recente
+    df = df.sort_values(["CNPJ_Num", "Data_Acao"], ascending=[True, False]) \
+           .drop_duplicates("CNPJ_Num", keep="first")
+
     return df
 
 def enriquecer_em_comum_com_cda(rel_em_comum_df: pd.DataFrame, df_cda: pd.DataFrame) -> pd.DataFrame:
-    if rel_em_comum_df is None or rel_em_comum_df.empty:
-        out = rel_em_comum_df.copy()
-        if "CDA_Protocolo" not in out.columns:
-            out["CDA_Protocolo"] = ""
-        if "CDA_Competencia" not in out.columns:
-            out["CDA_Competencia"] = ""
-        return out
-    if df_cda is None or df_cda.empty:
-        out = rel_em_comum_df.copy()
-        out["CDA_Protocolo"] = "Não possui"
-        out["CDA_Competencia"] = "Não possui"
-        return out
+    # Se o relatório base estiver ausente, devolve DF vazio, nunca None
+    if rel_em_comum_df is None:
+        return pd.DataFrame(columns=["CNPJ", "Nome do fundo", "CDA_Protocolo", "CDA_Competencia", "CDA_Status"])
+
+    # Cópia e padronização mínima
     rel = rel_em_comum_df.copy()
+
+    # Garante as colunas que vamos criar, caso já existam mantém; caso contrário, cria depois do merge
+    expected_cols = ["CDA_Protocolo", "CDA_Competencia", "CDA_Status"]
+
+    # Se o DF do CDA veio vazio/None, apenas acrescenta colunas "Não possui"
+    if df_cda is None or (isinstance(df_cda, pd.DataFrame) and df_cda.empty):
+        for c in expected_cols:
+            if c not in rel.columns:
+                rel[c] = "Não possui"
+        return rel
+
+    # Normaliza chave de junção
     rel["CNPJ_Num"] = rel["CNPJ"].map(normaliza_cnpj)
+
+    # Garante que df_cda tenha as colunas necessárias; se não tiver, cria vazias para não quebrar o merge
+    df_cda = df_cda.copy()
+    for c in ["CNPJ_Num", "CDA_Protocolo", "CDA_Competencia", "CDA_Status"]:
+        if c not in df_cda.columns:
+            df_cda[c] = None
+
+    # Merge por CNPJ normalizado
     enx = rel.merge(
-        df_cda[["CNPJ_Num", "CDA_Protocolo", "CDA_Competencia"]],
+        df_cda[["CNPJ_Num", "CDA_Protocolo", "CDA_Competencia", "CDA_Status"]],
         on="CNPJ_Num", how="left"
     )
-    enx["CDA_Protocolo"] = enx["CDA_Protocolo"].fillna("Não possui")
-    enx["CDA_Competencia"] = enx["CDA_Competencia"].fillna("Não possui")
+
+    # Preenche faltantes
+    for c in expected_cols:
+        enx[c] = enx[c].fillna("Não possui")
+
+    # Posiciona colunas após "Mes de Referencia" (se existir)
     cols = list(enx.columns)
     insert_pos = cols.index("Mes de Referencia") + 1 if "Mes de Referencia" in cols else len(cols)
-    for newcol in ["CDA_Protocolo", "CDA_Competencia"]:
-        if newcol in cols:
-            cols.remove(newcol)
-    cols = cols[:insert_pos] + ["CDA_Protocolo", "CDA_Competencia"] + cols[insert_pos:]
+    for c in expected_cols:
+        if c in cols:
+            cols.remove(c)
+    cols = cols[:insert_pos] + expected_cols + cols[insert_pos:]
     enx = enx[cols]
+
+    # Remove coluna auxiliar
     if "CNPJ_Num" in enx.columns:
         enx = enx.drop(columns=["CNPJ_Num"])
-    return enx
+
+    return enx  
 
 # ======================= /CDA =====================================================
 
 # ======================== Balancete ===============================================
 
-import itertools
+
 
 def _linhas_excel_como_texto(arquivo_excel) -> list[str]:
     xls = pd.ExcelFile(arquivo_excel, engine="openpyxl")
@@ -628,116 +765,158 @@ def _extrair_mm_yyyy_de_nome_arquivo(linhas: list[str]) -> Optional[str]:
 
 # --- Substitua sua parse_protocolo_balancete por esta (XLSX)
 def parse_protocolo_balancete(arquivo_excel) -> pd.DataFrame:
-    df_raw = pd.read_excel(arquivo_excel, sheet_name=0, header=None, dtype=str)
+    # Lê como texto cru
+    df_raw = pd.read_excel(arquivo_excel, sheet_name=0, header=None, dtype=str, engine="openpyxl")
+
+    # Achata as linhas não-vazias
     linhas = []
-    for r, row in df_raw.iterrows():
-        for c, val in enumerate(row):
-            if pd.notna(val) and str(val).strip():
-                linhas.append((r, c, str(val).strip()))
+    for _, row in df_raw.iterrows():
+        for val in row.values:
+            if pd.isna(val):
+                continue
+            txt = str(val).strip()
+            if txt:
+                linhas.append(txt)
+
+    import re
+    pattern_cnpj = re.compile(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})")
+    pattern_mmYYYY6 = re.compile(r"(\d{6})(?!\d)")  # ex: 082025
 
     registros = []
-    for i, (r, c, txt) in enumerate(linhas):
-        txt_up = txt.strip().upper()
+    current = {"cnpj": None, "protocolo": None, "comp": None, "mmYYYY_file": None, "status": None}
 
-        # Se for PARTICIPANTE, tenta capturar o CNPJ e os dados relacionados
-        if txt_up.startswith("PARTICIPANTE"):
-            cnpj_fmt, cnpj_num = None, None
+    def flush():
+        if current["cnpj"] and current["protocolo"]:
+            cnpj_fmt = formatar_cnpj(current["cnpj"])
+            comp = current["mmYYYY_file"] or current["comp"] or ""
+            registros.append({
+                "CNPJ": cnpj_fmt,
+                "Balancete_Protocolo": current["protocolo"],
+                "Balancete_Competencia": comp,
+                "Balancete_Status": current.get("status") or ""
+            })
+        current.update({"cnpj": None, "protocolo": None, "comp": None, "mmYYYY_file": None, "status": None})
 
-            # procurar CNPJ logo abaixo
-            for rr in range(r, r+6):
-                row_vals = df_raw.iloc[rr].astype(str).tolist()
-                for cell in row_vals:
-                    m = re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", str(cell))
-                    if m:
-                        cnpj_fmt = m.group(1)
-                        cnpj_num = normaliza_cnpj(cnpj_fmt)
-                        break
-                if cnpj_fmt:
+    i, n = 0, len(linhas)
+    while i < n:
+        up = linhas[i].upper()
+
+        # Início novo bloco? fecha o anterior (se completo)
+        if up.startswith("PROTOCOLO DE CONFIRMA"):
+            if current["cnpj"] and current["protocolo"]:
+                flush()
+            i += 1
+            continue
+
+        # PARTICIPANTE -> CNPJ
+        if up.startswith("PARTICIPANTE"):
+            if current["cnpj"] and current["protocolo"]:
+                flush()
+            for j in range(i + 1, min(i + 12, n)):
+                m = pattern_cnpj.search(linhas[j])
+                if m:
+                    current["cnpj"] = normaliza_cnpj(m.group(1))
                     break
+            i += 1
+            continue
 
-            # procurar protocolo nas proximidades (antes/depois do participante)
-            protocolo = None
-            for rr in range(max(0, r-15), r+15):
-                row_vals = df_raw.iloc[rr].tolist()
-                for cc, cell in enumerate(row_vals):
-                    if isinstance(cell, str) and cell.strip().upper().startswith("Nº PROTOCOLO"):
-                        # pega célula vizinha
-                        if cc + 1 < len(row_vals):
-                            protocolo = str(row_vals[cc+1]).strip()
-                        break
-                if protocolo:
-                    break
+        # NOME DO ARQUIVO -> captura 082025 => 08/2025
+        if up.startswith("NOME DO ARQUIVO"):
+            if i + 1 < n:
+                m = pattern_mmYYYY6.search(linhas[i + 1])
+                if m:
+                    mm, yyyy = m.group(1)[:2], m.group(1)[2:]
+                    current["mmYYYY_file"] = f"{mm}/{yyyy}"
+            i += 2
+            continue
 
-            # procurar competência ANTES do participante
-            competencia = None
-            for rr in range(max(0, r-15), r+1):
-                row_vals = df_raw.iloc[rr].tolist()
-                for cc, cell in enumerate(row_vals):
-                    if isinstance(cell, str) and cell.strip().upper().startswith("COMPETÊNCIA"):
-                        if cc + 1 < len(row_vals):
-                            competencia_raw = row_vals[cc+1]
-                            # se for data do Excel, converte
-                            try:
-                                comp_date = pd.to_datetime(competencia_raw, errors="coerce")
-                                if pd.notna(comp_date):
-                                    competencia = f"{comp_date.month:02d}/{comp_date.year}"
-                                else:
-                                    competencia = str(competencia_raw).strip()
-                            except Exception:
-                                competencia = str(competencia_raw).strip()
-                        break
-                if competencia:
-                    break
+        # COMPETÊNCIA
+        if up.startswith("COMPET"):
+            val = linhas[i + 1].strip() if (i + 1) < n else ""
+            m2 = re.search(r"(\b\d{2}/\d{4}\b)", val)
+            if m2:
+                current["comp"] = m2.group(1)
+            else:
+                m3 = re.search(r"\b(\d{2})/(\d{2})/(\d{4})\b", val)
+                if m3:
+                    dd, mm, yyyy = m3.groups()
+                    current["comp"] = f"{mm}/{yyyy}"
+            i += 2
+            continue
 
-            if cnpj_num:
-                registros.append({
-                    "CNPJ": formatar_cnpj(cnpj_num),
-                    "Balancete_Protocolo": protocolo or "",
-                    "Balancete_Competencia": competencia or ""
-                })
+        # 🔎 STATUS (NOVO): próximo valor após "Status:"
+        if up.startswith("STATUS"):
+            val = linhas[i + 1].strip() if (i + 1) < n else ""
+            if val:
+                current["status"] = val
+            i += 2
+            continue
+
+        # Nº PROTOCOLO
+        if (up.startswith("Nº PROTOCOLO") or up.startswith("N° PROTOCOLO") or
+            up.startswith("NO PROTOCOLO") or up.startswith("Nº DO PROTOCOLO") or
+            up.startswith("N° DO PROTOCOLO")):
+            val = linhas[i + 1].strip() if (i + 1) < n else ""
+            current["protocolo"] = val[:-2] if val.endswith(".0") else val
+            i += 2
+            continue
+
+        i += 1
+
+    # Flush final
+    if current["cnpj"] and current["protocolo"]:
+        flush()
 
     if not registros:
-        return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"])
+        return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"])
 
-    df = pd.DataFrame(registros).drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
+    df = pd.DataFrame(registros).drop_duplicates("CNPJ", keep="first").reset_index(drop=True)
     return df
-
 
 def parse_protocolo_balancete_from_pdf(uploaded_pdf) -> pd.DataFrame:
     text = _read_text_from_pdf(uploaded_pdf)
     if not text:
-        return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"])
-    # Heurística: encontre CNPJs e, para cada um, busque protocolo nas proximidades
+        return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"])
+
     pattern_cnpj = re.compile(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})")
     pattern_proto = re.compile(r"(?:N[º°]\s*PROTOCOLO|PROTOCOLO)\D*(\d{6,})", flags=re.I)
     pattern_comp_mm_yyyy = re.compile(r"(\b\d{2}/\d{4}\b)")
+    pattern_status = re.compile(r"STATUS:\s*([\s\S]{0,40}?)(?:\r?\n|\r)", flags=re.I)  # captura linha após "Status:"
+
     registros = []
     for m in pattern_cnpj.finditer(text):
         cnpj_masked = m.group(1)
         start = m.start()
-        # busca protocolo nos 500 caracteres seguintes
-        window = text[start:start+500]
+
+        window = text[start:start+600]
         proto_m = pattern_proto.search(window)
         protocolo = proto_m.group(1) if proto_m else ""
-        # busca competência no trecho anterior (200 chars)
+
         prev_window = text[max(0, start-400):start+200]
         comp_m = pattern_comp_mm_yyyy.search(prev_window)
         competencia = comp_m.group(1) if comp_m else ""
+
+        status_m = pattern_status.search(prev_window) or pattern_status.search(window)
+        status_txt = status_m.group(1).strip() if status_m else ""
+
         cnpj_num = normaliza_cnpj(cnpj_masked)
         if cnpj_num:
             registros.append({
                 "CNPJ": formatar_cnpj(cnpj_num),
                 "Balancete_Protocolo": protocolo,
-                "Balancete_Competencia": competencia
+                "Balancete_Competencia": competencia,
+                "Balancete_Status": status_txt
             })
+
     if not registros:
-        return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"])
-    df = pd.DataFrame(registros)
-    df = df.drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
+        return pd.DataFrame(columns=["CNPJ", "Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"])
+
+    df = pd.DataFrame(registros).drop_duplicates(subset="CNPJ", keep="first").reset_index(drop=True)
     return df
 
+
 # ========================== INTERFACE STREAMLIT ==========================
-st.set_page_config(page_title="Batimento de Fundos - CadFi x Controle", page_icon="📊", layout="centered")
+st.set_page_config(page_title="Batimento de Fundos - CadFi x Controle",page_icon="banco_do_brasil_amarelo.ico", layout="centered")
 
 st.title("Batimento de Fundos — Contabilidade")
 st.subheader("📊 1° - Batimento de Fundos — CadFi x Controle")
@@ -776,47 +955,61 @@ if processar:
             rel_comum = remover_segundos_colunas(rel_comum, ["CDA_Protocolo", "CDA_Competencia"])
             rel_controle_fora = relatorio_controle_fora_cadfi(df_controle_fora)
 
-        st.success(f"✅ Em comum: {len(rel_comum)} fundo(s)")
-        st.info(f"ℹ️ No Controle e NÃO no CadFi: {len(rel_controle_fora)} fundo(s)")
-        st.warning(f"❌ Fora do Controle (presentes no CadFi, ausentes no Controle): {len(rel_fora)} fundo(s)")
+            rel_comum = adicionar_drive_por_cnpj(rel_comum, controle_prep)
+            
+            if "Drive" in rel_comum.columns:
+                cols = ["Drive"] + [col for col in rel_comum.columns if col != "Drive"]
+                rel_comum = rel_comum[cols]
+            
+            rel_fora = adicionar_drive_por_cnpj(rel_fora, controle_prep)
+            rel_controle_fora = adicionar_drive_por_cnpj(rel_controle_fora, controle_prep)
 
-        with st.expander("✅ Fundos presentes em AMBOS (CadFi e Controle)"):
-            st.dataframe(rel_comum, use_container_width=True, hide_index=True)
+            st.session_state["rel_comum"] = rel_comum
+            st.session_state["rel_fora"] = rel_fora
+            st.session_state["rel_controle_fora"] = rel_controle_fora
 
-        with st.expander("ℹ️ Fundos do Controle que NÃO estão no CadFi"):
-            st.dataframe(rel_controle_fora, use_container_width=True, hide_index=True)
+            # Salva mensagens fixas
+            st.session_state["mensagens_batimento"] = [
+                f"✅ Em comum: {len(rel_comum)} fundo(s)",
+                f"ℹ️ No Controle e NÃO no CadFi: {len(rel_controle_fora)} fundo(s)",
+                f"❌ Fora do Controle (presentes no CadFi, ausentes no Controle): {len(rel_fora)} fundo(s)"
+            ]
 
-        with st.expander("❌ Fundos do CadFi que NÃO estão no Controle"):
-            st.dataframe(rel_fora, use_container_width=True, hide_index=True)
+            with st.expander("✅ Fundos presentes em AMBOS (CadFi e Controle)"):
+                st.dataframe(rel_comum, use_container_width=True, hide_index=True)
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
+            with st.expander("ℹ️ Fundos do Controle que NÃO estão no CadFi"):
+                st.dataframe(rel_controle_fora, use_container_width=True, hide_index=True)
+
+            with st.expander("❌ Fundos do CadFi que NÃO estão no Controle"):
+                st.dataframe(rel_fora, use_container_width=True, hide_index=True)
+
+            def gerar_zip_relatorios(rel_comum, rel_fora, rel_controle_fora):
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w") as zipf:
+                    zipf.writestr("Relatorio_Fundos_Em_Ambos.xlsx", to_excel_bytes(rel_comum).getvalue())
+                    zipf.writestr("Relatorio_Fundos_Somente_no_CadFi.xlsx", to_excel_bytes(rel_fora).getvalue())
+                    zipf.writestr("Relatorio_Fundos_Somente_no_Controle.xlsx", to_excel_bytes(rel_controle_fora).getvalue())
+                zip_buffer.seek(0)
+                return zip_buffer
+
             st.download_button(
-                label="⬇️ Baixar — Fundos em AMBOS (CadFi e Controle)",
-                data=to_excel_bytes(rel_comum, sheet_name="Em_Comum"),
-                file_name="Relatorio_Fundos_Em_Ambos.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        with c2:
-            st.download_button(
-                label="⬇️ Baixar — Somente no CadFi (não no Controle)",
-                data=to_excel_bytes(rel_fora, sheet_name="Somente_no_CadFi"),
-                file_name="Relatorio_Fundos_Somente_no_CadFi.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-        with c3:
-            st.download_button(
-                label="⬇️ Baixar — Somente no Controle (não no CadFi)",
-                data=to_excel_bytes(rel_controle_fora, sheet_name="Somente_no_Controle"),
-                file_name="Relatorio_Fundos_Somente_no_Controle.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                label="⬇️ Baixar TODOS os relatórios (.zip)",
+                data=gerar_zip_relatorios(rel_comum, rel_fora, rel_controle_fora),
+                file_name="Relatorios_Batimento_CadFi_Controle.zip",
+                mime="application/zip"
             )
 
     except Exception as e:
+        st.error("❌ Erro ao processar os arquivos.")
         st.exception(e)
 
-st.markdown("---")
-st.caption("Dica: se as colunas do Excel vierem com acentos/variações, o app normaliza nomes para evitar erros.")
+# Exibe mensagens fixas fora do bloco de processamento
+if "mensagens_batimento" in st.session_state:
+    for msg in st.session_state["mensagens_batimento"]:
+        st.markdown(msg)
+
+
 
 # ========================== INTERFACE: CDA (Enriquecer "Em Ambos") ==========================
 st.markdown("---")
@@ -849,6 +1042,11 @@ if bt_cda:
             tot = len(df_final)
             casados = df_final["CDA_Protocolo"].astype(str).str.strip().ne("Não possui").sum()
             st.success(f"✅ Encontramos protocolo do CDA para {casados} de {tot} fundos.")
+            
+            st.session_state["mensagens_cda"] = [
+                f"✅ Encontramos protocolo do CDA para {casados} de {tot} fundos."
+            ]
+
 
             with st.expander("🔎 Prévia do relatório enriquecido"):
                 st.dataframe(df_final, use_container_width=True, hide_index=True)
@@ -859,14 +1057,25 @@ if bt_cda:
                 file_name="Relatorio_Em_Ambos_com_CDA.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+            
     except Exception as e:
         st.exception(e)
+        
+if "mensagens_cda" in st.session_state:
+    for msg in st.session_state["mensagens_cda"]:
+        st.markdown(msg)
 
-#====================================== Interface de Balancete -============================
-st.markdown("## 🔄 3° - Enriquecer batimento com Balancete")
+
+# ============================== Interface de Balancete ==============================
+st.markdown("## 🔄 3º - Enriquecer batimento com Balancete")
+
 colb1, colb2 = st.columns(2)
 with colb1:
-    relatorio_ambos_file = st.file_uploader("Arquivo Relatório de Ambos com CDA (.xlsx)", type=["xlsx"], key="relatorio_ambos")
+    relatorio_ambos_file = st.file_uploader(
+        "Arquivo Relatório de Ambos com CDA (.xlsx)",
+        type=["xlsx"],
+        key="relatorio_ambos"
+    )
 with colb2:
     balancete_file = st.file_uploader(
         "Arquivo de Balancete (XLSX ou PDF)",
@@ -883,7 +1092,7 @@ if enriquecer:
 
     try:
         with st.spinner("Enriquecendo com Balancete..."):
-            # Carrega relatório 'Em Ambos'
+            # 1) Carrega relatório 'Em Ambos'
             df_rel_comum = pd.read_excel(relatorio_ambos_file, dtype=str)
             df_rel_comum = padronizar_colunas(df_rel_comum)
 
@@ -891,52 +1100,91 @@ if enriquecer:
                 st.error("O relatório 'Em Ambos' precisa ter a coluna 'CNPJ'.")
                 st.stop()
 
-            # Parse do arquivo de balancete (xlsx mais confiável; pdf heurístico)
+            # 2) Parse do arquivo de balancete (xlsx mais confiável; pdf heurístico)
             fname = str(getattr(balancete_file, "name", "")).lower()
             if fname.endswith(".xlsx"):
                 df_balancete_proto = parse_protocolo_balancete(balancete_file)
             else:
                 df_balancete_proto = parse_protocolo_balancete_from_pdf(balancete_file)
 
-            # Garantir padronização/formatacao das colunas e CNPJ
+            # 3) Padroniza colunas e normaliza CNPJ nas duas pontas
             df_balancete_proto = padronizar_colunas(df_balancete_proto)
-            if "CNPJ" in df_balancete_proto.columns:
-                df_balancete_proto["CNPJ"] = df_balancete_proto["CNPJ"].apply(lambda x: formatar_cnpj(normaliza_cnpj(x)) if pd.notna(x) else None)
-            # preencher nomes das colunas esperadas se vierem com nomes diferentes
-            # já trabalhamos com "Balancete_Protocolo" e "Balancete_Competencia"
 
-            # Merge (normalizando formato CNPJ em ambos)
-            df_rel_comum["CNPJ"] = df_rel_comum["CNPJ"].apply(lambda x: formatar_cnpj(normaliza_cnpj(x)) if pd.notna(x) else None)
-            if "CNPJ" not in df_balancete_proto.columns:
-                st.warning("Não foi possível extrair CNPJ do arquivo de Balancete — verifique o layout. Resultado pode ficar vazio.")
+            # Normaliza CNPJ do relatório-base
+            df_rel_comum["CNPJ"] = df_rel_comum["CNPJ"].apply(
+                lambda x: formatar_cnpj(normaliza_cnpj(x)) if pd.notna(x) else None
+            )
+
+            # Normaliza CNPJ do balancete (se existir)
+            if "CNPJ" in df_balancete_proto.columns:
+                df_balancete_proto["CNPJ"] = df_balancete_proto["CNPJ"].apply(
+                    lambda x: formatar_cnpj(normaliza_cnpj(x)) if pd.notna(x) else None
+                )
+            else:
+                st.warning(
+                    "Não foi possível extrair CNPJ do arquivo de Balancete — verifique o layout. "
+                    "O resultado pode ficar vazio."
+                )
+
+            # 4) Fallback: garante as colunas esperadas do balancete para o merge
+            for c in ["Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"]:
+                if c not in df_balancete_proto.columns:
+                    df_balancete_proto[c] = None
+
+            # 5) Merge por CNPJ
             merged = df_rel_comum.merge(
-                df_balancete_proto[["CNPJ", "Balancete_Protocolo", "Balancete_Competencia"]],
+                df_balancete_proto[["CNPJ", "Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"]],
                 on="CNPJ",
                 how="left"
             )
 
-            merged["Balancete_Protocolo"] = merged["Balancete_Protocolo"].fillna("Não possui")
-            merged["Balancete_Competencia"] = merged["Balancete_Competencia"].fillna("Não possui")
+            # Preenche vazios
+            for c in ["Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"]:
+                merged[c] = merged[c].fillna("Não possui")
 
-            # Posicionar colunas após 'Mes de Referencia' se existir
+            # (Opcional) Se quiser forçar competência para DD/MM/AAAA com dia 01:
+            # def _mm_aaaa_to_dd_mm_aaaa(s):
+            #     if isinstance(s, str) and "/" in s and len(s) == 7:
+            #         mm, aaaa = s.split("/")
+            #         return f"01/{mm}/{aaaa}"
+            #     return s
+            # merged["Balancete_Competencia"] = merged["Balancete_Competencia"].map(_mm_aaaa_to_dd_mm_aaaa)
+
+            # 6) Posiciona colunas após 'Mes de Referencia' (se existir)
             cols = list(merged.columns)
             insert_pos = cols.index("Mes de Referencia") + 1 if "Mes de Referencia" in cols else len(cols)
-            for newcol in ["Balancete_Protocolo", "Balancete_Competencia"]:
-                if newcol in cols:
-                    cols.remove(newcol)
-            cols = cols[:insert_pos] + ["Balancete_Protocolo", "Balancete_Competencia"] + cols[insert_pos:]
+
+            for c in ["Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"]:
+                if c in cols:
+                    cols.remove(c)
+
+            cols = (
+                cols[:insert_pos]
+                + ["Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"]
+                + cols[insert_pos:]
+            )
             merged = merged[cols]
 
-            # Mostrar resultado e download
+            # 7) Exibe e disponibiliza download
             encontrados = merged["Balancete_Protocolo"].astype(str).str.strip().ne("Não possui").sum()
             st.success(f"✅ Enriquecido com {encontrados} protocolos encontrados.")
             st.dataframe(merged, use_container_width=True, hide_index=True)
 
+            # Mensagem fixa + download
+            st.session_state["mensagens_balancete"] = [
+                f"✅ Enriquecido com {encontrados} protocolos encontrados."
+            ]
             st.download_button(
                 label="⬇️ Baixar — Relatório Enriquecido com Balancete",
                 data=to_excel_bytes(merged, sheet_name="Enriquecido_Balancete"),
                 file_name="Relatorio_Enriquecido_Balancete.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
     except Exception as e:
         st.exception(e)
+
+# Mensagens persistentes
+if "mensagens_balancete" in st.session_state:
+    for msg in st.session_state["mensagens_balancete"]:
+        st.markdown(msg)
