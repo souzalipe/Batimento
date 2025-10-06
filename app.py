@@ -534,6 +534,40 @@ def remover_segundos_colunas(df: pd.DataFrame, colunas, formato: str = "%Y-%m-%d
             )
     return df
 
+def _competencia_to_01_mm_aaaa(s: Optional[str]) -> Optional[str]:
+    """Converte valores como '2025-08', '08/2025' ou 'dd/mm/aaaa' para '01/MM/AAAA'.
+       Mantém 'Não possui' e vazios como estão.
+    """
+    if s is None:
+        return None
+    t = str(s).strip()
+    if not t or t.upper() == "NÃO POSSUI":
+        return t
+
+    # Caso: AAAA-MM  -> 01/MM/AAAA
+    m = re.fullmatch(r"(20\d{2})-(\d{1,2})", t)
+    if m:
+        ano, mes = int(m.group(1)), int(m.group(2))
+        if 1 <= mes <= 12:
+            return f"01/{mes:02d}/{ano}"
+
+    # Caso: MM/AAAA  -> 01/MM/AAAA
+    m = re.fullmatch(r"(\d{1,2})/(20\d{2})", t)
+    if m:
+        mes, ano = int(m.group(1)), int(m.group(2))
+        if 1 <= mes <= 12:
+            return f"01/{mes:02d}/{ano}"
+
+    # Caso: DD/MM/AAAA -> força dia 01
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(20\d{2})", t)
+    if m:
+        mes, ano = int(m.group(2)), int(m.group(3))
+        if 1 <= mes <= 12:
+            return f"01/{mes:02d}/{ano}"
+
+    # Sem correspondência -> devolve como veio
+
+
 def parse_protocolos_cda_xlsx(arquivo_xlsx) -> pd.DataFrame:
     df_raw = pd.read_excel(arquivo_xlsx, sheet_name=0, header=None, dtype=str)
     lines = []
@@ -713,6 +747,11 @@ def enriquecer_em_comum_com_cda(rel_em_comum_df: pd.DataFrame, df_cda: pd.DataFr
     # Preenche faltantes
     for c in expected_cols:
         enx[c] = enx[c].fillna("Não possui")
+        
+    # 🔽 PADRONIZA A COMPETÊNCIA DO CDA PARA 01/MM/AAAA
+    if "CDA_Competencia" in enx.columns:
+        enx["CDA_Competencia"] = enx["CDA_Competencia"].map(_competencia_to_01_mm_aaaa)
+
 
     # Posiciona colunas após "Mes de Referencia" (se existir)
     cols = list(enx.columns)
@@ -1140,15 +1179,12 @@ if enriquecer:
             for c in ["Balancete_Protocolo", "Balancete_Competencia", "Balancete_Status"]:
                 merged[c] = merged[c].fillna("Não possui")
 
-            # (Opcional) Se quiser forçar competência para DD/MM/AAAA com dia 01:
-            # def _mm_aaaa_to_dd_mm_aaaa(s):
-            #     if isinstance(s, str) and "/" in s and len(s) == 7:
-            #         mm, aaaa = s.split("/")
-            #         return f"01/{mm}/{aaaa}"
-            #     return s
-            # merged["Balancete_Competencia"] = merged["Balancete_Competencia"].map(_mm_aaaa_to_dd_mm_aaaa)
+            # 🔽 PADRONIZA COMPETÊNCIA para 01/MM/AAAA (CDA e Balancete):
+            for col in ["CDA_Competencia", "Balancete_Competencia"]:
+                if col in merged.columns:
+                    merged[col] = merged[col].map(_competencia_to_01_mm_aaaa)
 
-            # 6) Posiciona colunas após 'Mes de Referencia' (se existir)
+
             cols = list(merged.columns)
             insert_pos = cols.index("Mes de Referencia") + 1 if "Mes de Referencia" in cols else len(cols)
 
