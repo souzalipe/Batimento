@@ -71,6 +71,321 @@ def _normalize_competencia_to_mm_yyyy(raw: Optional[str]) -> Optional[str]:
 
     return None
 
+# === Helpers para validação por data exata OU por mês/ano (compatível com Python 3.9) ===
+import re
+import pandas as pd
+from typing import Optional
+
+# Extrai MM/AAAA de vários formatos comuns
+def _extrair_mm_aaaa(valor: Optional[str]) -> Optional[str]:
+    if not valor:
+        return None
+    s = str(valor).strip()
+
+    # 'DD/MM/AAAA' -> MM/AAAA
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(20\d{2})", s)
+    if m:
+        mm, aaaa = int(m.group(2)), int(m.group(3))
+        if 1 <= mm <= 12:
+            return f"{mm:02d}/{aaaa}"
+
+    # 'MM/AAAA'
+    m = re.fullmatch(r"(\d{1,2})/(20\d{2})", s)
+    if m:
+        mm, aaaa = int(m.group(1)), int(m.group(2))
+        if 1 <= mm <= 12:
+            return f"{mm:02d}/{aaaa}"
+
+    # 'AAAA-MM'
+    m = re.fullmatch(r"(20\d{2})-(\d{1,2})", s)
+    if m:
+        aaaa, mm = int(m.group(1)), int(m.group(2))
+        if 1 <= mm <= 12:
+            return f"{mm:02d}/{aaaa}"
+
+    return None
+
+# === Consolidação e resumo das divergências (compatível com Python 3.9) ===
+import pandas as pd
+from typing import Optional, Dict
+
+def consolidar_incons_por_fundo(df_incons: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converte o DF de inconsistências (uma linha por origem) em um DF consolidado (uma linha por CNPJ),
+    com colunas lado a lado para CDA e Balancete.
+    """
+    cols_base = {"CNPJ", "Nome do fundo", "Origem", "Competência atual", "Competência esperada"}
+    if not cols_base.issubset(df_incons.columns):
+        return pd.DataFrame(columns=[
+            "CNPJ","Nome do fundo","CDA atual","CDA esperada","Balancete atual","Balancete esperada"
+        ])
+
+    cda = (
+        df_incons[df_incons["Origem"]=="CDA"]
+        [["CNPJ","Nome do fundo","Competência atual","Competência esperada"]]
+        .rename(columns={"Competência atual":"CDA atual","Competência esperada":"CDA esperada"})
+    )
+    bal = (
+        df_incons[df_incons["Origem"]=="Balancete"]
+        [["CNPJ","Nome do fundo","Competência atual","Competência esperada"]]
+        .rename(columns={"Competência atual":"Balancete atual","Balancete esperada":"Balancete esperada"})
+    )
+
+    # OBS: Corrige um rename que o Python não faria automaticamente
+    if "Balancete esperada" not in bal.columns:
+        bal = bal.rename(columns={"Competência esperada":"Balancete esperada"})
+
+    full = pd.merge(cda, bal, on=["CNPJ","Nome do fundo"], how="outer")
+    # Ordena e garante as colunas na ordem desejada
+    for col in ["CDA atual","CDA esperada","Balancete atual","Balancete esperada"]:
+        if col not in full.columns:
+            full[col] = pd.NA
+
+    return full[["CNPJ","Nome do fundo","CDA atual","CDA esperada","Balancete atual","Balancete esperada"]] \
+             .drop_duplicates(subset=["CNPJ"]) \
+             .sort_values(by=["CNPJ"])
+
+def resumo_divergencias(df_incons: pd.DataFrame, df_base: pd.DataFrame) -> Dict[str, int]:
+    """
+    Retorna métricas resumidas:
+      - total_fundos: nº de CNPJs na base
+      - linhas: nº de linhas no relatório de inconsistências (CDA + Balancete)
+      - fundos_com_erro: nº de CNPJs únicos com qualquer divergência
+      - somente_cda / somente_balancete / ambos: nº de CNPJs por segmento
+    """
+    total_fundos = df_base["CNPJ"].dropna().nunique() if "CNPJ" in df_base.columns else 0
+    linhas = len(df_incons)
+
+    if linhas == 0:
+        return {
+            "total_fundos": total_fundos,
+            "linhas": 0,
+            "fundos_com_erro": 0,
+            "somente_cda": 0,
+            "somente_balancete": 0,
+            "ambos": 0,
+        }
+
+    cnpjs_cda = set(df_incons[df_incons["Origem"]=="CDA"]["CNPJ"].dropna())
+    cnpjs_bal = set(df_incons[df_incons["Origem"]=="Balancete"]["CNPJ"].dropna())
+    fundos_com_erro = len(cnpjs_cda | cnpjs_bal)
+    ambos = len(cnpjs_cda & cnpjs_bal)
+    somente_cda = len(cnpjs_cda - cnpjs_bal)
+    somente_balancete = len(cnpjs_bal - cnpjs_cda)
+
+    return {
+        "total_fundos": total_fundos,
+        "linhas": linhas,
+        "fundos_com_erro": fundos_com_erro,
+        "somente_cda": somente_cda,
+        "somente_balancete": somente_balancete,
+        "ambos": ambos,
+    }
+
+
+# Normaliza uma string data 'qualquer' para DD/MM/AAAA quando possível (mantém "Não possui")
+def _coagir_para_dd_mm_aaaa(valor: Optional[str]) -> Optional[str]:
+    if valor is None:
+        return None
+    t = str(valor).strip()
+    if not t or t.upper() == "NÃO POSSUI":
+        return t
+
+    # Já está em DD/MM/AAAA válido
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(20\d{2})", t)
+    if m:
+        return t
+
+    # Se veio MM/AAAA ou AAAA-MM, força dia 01
+    mm_aaaa = _extrair_mm_aaaa(t)
+    if mm_aaaa:
+        mm, aaaa = mm_aaaa.split("/")
+        return f"01/{mm}/{aaaa}"
+
+    # Sem reconhecer: devolve como veio
+    return t
+
+def validar_por_data_exata(
+    df: pd.DataFrame,
+    data_alvo_ddmmaaaa: str,
+    contar_nao_possui: bool = True
+) -> pd.DataFrame:
+    """
+    Compara se CDA_Competencia e Balancete_Competencia == data_alvo (DD/MM/AAAA) exatamente.
+    Retorna apenas as inconsistências.
+    """
+    # Sanitiza a data alvo (aceita 1/8/2025, 01/8/2025, etc.)
+    m = re.fullmatch(r"\s*(\d{1,2})/(\d{1,2})/(20\d{2})\s*", str(data_alvo_ddmmaaaa))
+    if not m:
+        raise ValueError("Data inválida. Use o formato DD/MM/AAAA.")
+    dd, mm, aaaa = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= mm <= 12 and 1 <= dd <= 31):
+        raise ValueError("Data inválida. Verifique dia e mês.")
+    data_alvo = f"{dd:02d}/{mm:02d}/{aaaa}"
+
+    inconsistencias = []
+    col_nome = None
+    for c in ("Nome do fundo", "Denominacao_Social", "Denominacao Social", "Denominacao"):
+        if c in df.columns:
+            col_nome = c
+            break
+
+    for col, origem in (("CDA_Competencia", "CDA"), ("Balancete_Competencia", "Balancete")):
+        if col not in df.columns:
+            continue
+        for _, row in df.iterrows():
+            atual = row.get(col)
+            if atual is None:
+                continue
+            if str(atual).strip().upper() == "NÃO POSSUI":
+                if contar_nao_possui:
+                    inconsistencias.append({
+                        "CNPJ": row.get("CNPJ"),
+                        "Nome do fundo": (row.get(col_nome) if col_nome else None),
+                        "Origem": origem,
+                        "Competência atual": atual,
+                        "Competência esperada": data_alvo
+                    })
+                continue
+
+            atual_norm = _coagir_para_dd_mm_aaaa(atual)
+            if atual_norm != data_alvo:
+                inconsistencias.append({
+                    "CNPJ": row.get("CNPJ"),
+                    "Nome do fundo": (row.get(col_nome) if col_nome else None),
+                    "Origem": origem,
+                    "Competência atual": atual,
+                    "Competência esperada": data_alvo
+                })
+
+    return pd.DataFrame(inconsistencias)
+
+def validar_por_mes_ano(
+    df: pd.DataFrame,
+    mes_ano_alvo: str,  # "MM/AAAA"
+    contar_nao_possui: bool = True
+) -> pd.DataFrame:
+    """
+    Compara apenas MM/AAAA das colunas CDA_Competencia e Balancete_Competencia.
+    Retorna apenas as inconsistências.
+    """
+    m = re.fullmatch(r"\s*(\d{1,2})/(20\d{2})\s*", str(mes_ano_alvo))
+    if not m:
+        raise ValueError("Mês/Ano inválido. Use o formato MM/AAAA.")
+    mm, aaaa = int(m.group(1)), int(m.group(2))
+    if not (1 <= mm <= 12):
+        raise ValueError("Mês inválido (1-12).")
+    alvo_mm_aaaa = f"{mm:02d}/{aaaa}"
+
+    inconsistencias = []
+    col_nome = None
+    for c in ("Nome do fundo", "Denominacao_Social", "Denominacao Social", "Denominacao"):
+        if c in df.columns:
+            col_nome = c
+            break
+
+    for col, origem in (("CDA_Competencia", "CDA"), ("Balancete_Competencia", "Balancete")):
+        if col not in df.columns:
+            continue
+        for _, row in df.iterrows():
+            atual = row.get(col)
+            if atual is None:
+                continue
+            if str(atual).strip().upper() == "NÃO POSSUI":
+                if contar_nao_possui:
+                    inconsistencias.append({
+                        "CNPJ": row.get("CNPJ"),
+                        "Nome do fundo": (row.get(col_nome) if col_nome else None),
+                        "Origem": origem,
+                        "Competência atual": atual,
+                        "Competência esperada": f"Qualquer dia/{alvo_mm_aaaa}"
+                    })
+                continue
+
+            mm_aaaa = _extrair_mm_aaaa(str(atual))
+            if mm_aaaa != alvo_mm_aaaa:
+                inconsistencias.append({
+                    "CNPJ": row.get("CNPJ"),
+                    "Nome do fundo": (row.get(col_nome) if col_nome else None),
+                    "Origem": origem,
+                    "Competência atual": str(atual),
+                    "Competência esperada": f"Qualquer dia/{alvo_mm_aaaa}"
+                })
+
+    return pd.DataFrame(inconsistencias)
+
+
+# === Helpers para validação de dia da competência (compatível com Python 3.9) ===
+import re
+import pandas as pd
+from typing import Optional
+
+def _extrair_mm_aaaa(valor: str) -> Optional[str]:
+    if not valor:
+        return None
+    s = str(valor).strip()
+    # aceita 'DD/MM/AAAA'
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(20\d{2})", s)
+    if m:
+        return f"{m.group(2)}/{m.group(3)}"
+    # aceita 'MM/AAAA'
+    m = re.fullmatch(r"(\d{2})/(20\d{2})", s)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    # aceita 'AAAA-MM'
+    m = re.fullmatch(r"(20\d{2})-(\d{1,2})", s)
+    if m:
+        mm = int(m.group(2))
+        if 1 <= mm <= 12:
+            return f"{mm:02d}/{m.group(1)}"
+    return None
+
+def _ajustar_dia_competencia(valor: Optional[str], dia: int) -> Optional[str]:
+    """Gera 'DD/MM/AAAA' usando o MM/AAAA detectado no valor e o dia informado.
+       Mantém 'Não possui' igual."""
+    if valor is None:
+        return None
+    t = str(valor).strip()
+    if not t:
+        return t
+    if t.upper() == "NÃO POSSUI":
+        return t
+    mm_aaaa = _extrair_mm_aaaa(t)
+    if not mm_aaaa:
+        return t  # devolve como veio se não der p/ extrair mês/ano
+    mm, aaaa = mm_aaaa.split("/")
+    return f"{int(dia):02d}/{mm}/{aaaa}"
+
+def validar_competencias_por_dia(df: pd.DataFrame, dia: int, contar_nao_possui: bool = True) -> pd.DataFrame:
+    """Retorna um DF apenas com as inconsistências (CNPJ, Origem, Competência atual, Competência esperada)."""
+    inconsistencias = []
+    col_nome = None
+    for c in ("Nome do fundo", "Denominacao_Social", "Denominacao Social", "Denominacao"):
+        if c in df.columns:
+            col_nome = c
+            break
+
+    for col, origem in (("CDA_Competencia", "CDA"), ("Balancete_Competencia", "Balancete")):
+        if col not in df.columns:
+            continue
+        for _, row in df.iterrows():
+            atual = row.get(col)
+            if atual is None:
+                continue
+            if str(atual).strip().upper() == "NÃO POSSUI" and not contar_nao_possui:
+                continue
+            esperado = _ajustar_dia_competencia(atual, dia)
+            # Divergência quando strings não batem exatamente
+            if atual != esperado:
+                inconsistencias.append({
+                    "CNPJ": row.get("CNPJ"),
+                    "Nome do fundo": (row.get(col_nome) if col_nome else None),
+                    "Origem": origem,
+                    "Competência atual": atual,
+                    "Competência esperada": esperado
+                })
+    return pd.DataFrame(inconsistencias)
+
 
 
 def _encontrar_coluna_drive(df: pd.DataFrame) -> Optional[str]:
@@ -1085,13 +1400,13 @@ if bt_cda:
             ]
 
 
-            with st.expander("🔎 Prévia do relatório enriquecido"):
+            with st.expander("🔎 Prévia do Batimento do CDA"):
                 st.dataframe(df_final, use_container_width=True, hide_index=True)
 
             st.download_button(
-                label="⬇️ Baixar — 'Em Ambos' enriquecido com CDA",
+                label="⬇️ Baixar — Batimento do CDA",
                 data=to_excel_bytes(df_final, sheet_name="Em_Ambos_com_CDA"),
-                file_name="Relatorio_Em_Ambos_com_CDA.xlsx",
+                file_name="Batimento do CDA.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             
@@ -1209,11 +1524,14 @@ if enriquecer:
                 f"✅ Enriquecido com {encontrados} protocolos encontrados."
             ]
             st.download_button(
-                label="⬇️ Baixar — Relatório Enriquecido com Balancete",
-                data=to_excel_bytes(merged, sheet_name="Enriquecido_Balancete"),
-                file_name="Relatorio_Enriquecido_Balancete.xlsx",
+                label="⬇️ Baixar — Batimento do CDA e do Balancete",
+                data=to_excel_bytes(merged, sheet_name="Batimento do CDA e do Balancete"),
+                file_name="Batimento do CDA e do Balancete.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+        # ... após montar `merged`
+        st.session_state["rel_enriquecido_balancete"] = merged  # <- adiciona esta linha
+
 
     except Exception as e:
         st.exception(e)
@@ -1222,3 +1540,112 @@ if enriquecer:
 if "mensagens_balancete" in st.session_state:
     for msg in st.session_state["mensagens_balancete"]:
         st.markdown(msg)
+
+# ============================== 4º - Validação de Competência (CDA & Balancete) ==============================
+st.markdown("## ✅ 4º - Validação de Competência (CDA & Balancete)")
+
+with st.form("form_validacao_comp"):
+    modo = st.radio("Validar por:", ("Data exata (DD/MM/AAAA)", "Mês/Ano (MM/AAAA)"), horizontal=True)
+    if modo.startswith("Data exata"):
+        data_alvo = st.text_input("Data da competência (DD/MM/AAAA)", value="01/08/2025", placeholder="DD/MM/AAAA")
+        mes_ano_alvo = None
+    else:
+        mes_ano_alvo = st.text_input("Mês/Ano da competência (MM/AAAA)", value="08/2025", placeholder="MM/AAAA")
+        data_alvo = None
+
+    contar_nao_possui = st.checkbox('Contar "Não possui" como erro', value=True)
+    validar_btn = st.form_submit_button("Validar agora")
+
+if validar_btn:
+    df_base = st.session_state.get("rel_enriquecido_balancete")  # gerado no passo 3
+    if df_base is None:
+        st.warning("Antes, rode o 3º passo (Balancete) para gerar o relatório enriquecido.")
+    else:
+        try:
+            if modo.startswith("Data exata"):
+                inconsist = validar_por_data_exata(df_base, data_alvo, contar_nao_possui=contar_nao_possui)
+                titulo_rel = f"Divergencias_Competencia_{data_alvo.replace('/', '-')}"
+                alvo_msg = data_alvo
+            else:
+                inconsist = validar_por_mes_ano(df_base, mes_ano_alvo, contar_nao_possui=contar_nao_possui)
+                titulo_rel = f"Divergencias_Competencia_{mes_ano_alvo.replace('/', '-')}"
+                alvo_msg = mes_ano_alvo
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
+
+        # Resumo correto (CNPJ únicos)
+        resumo = resumo_divergencias(inconsist, df_base)
+        if resumo["fundos_com_erro"] == 0:
+            st.success(f"Tudo certo! Nenhuma divergência para {alvo_msg}. "
+                       f"Fundos na base: {resumo['total_fundos']}.")
+        else:
+            perc = (resumo["fundos_com_erro"]/resumo["total_fundos"]) if resumo["total_fundos"] else 0
+            st.error(
+                f"Foram encontrados **{resumo['fundos_com_erro']} fundos** com divergência "
+                f"({perc:.1%} do total de {resumo['total_fundos']}).\n\n"
+                f"Linhas de divergência: {resumo['linhas']}."
+            )
+            st.caption(
+                f"Quebra por origem — Somente **CDA**: {resumo['somente_cda']} • "
+                f"Somente **Balancete**: {resumo['somente_balancete']} • "
+                f"**Ambos**: {resumo['ambos']}"
+            )
+
+            # 1) Grid de linhas (auditoria)
+            with st.expander("🔎 Ver linhas de divergência (CDA e Balancete)"):
+                st.dataframe(inconsist, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Baixar (linhas) — Divergências por origem",
+                    data=to_excel_bytes(inconsist, sheet_name="Divergencias_Linhas"),
+                    file_name=f"{titulo_rel}_linhas.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            # 2) Consolidado por fundo (uma linha por CNPJ)
+            consol = consolidar_incons_por_fundo(inconsist)
+
+            # Segmentos por CNPJ
+            tem_cda = consol["CDA atual"].notna() | consol["CDA esperada"].notna()
+            tem_bal = consol["Balancete atual"].notna() | consol["Balancete esperada"].notna()
+            df_so_cda = consol[tem_cda & ~tem_bal]
+            df_so_bal = consol[~tem_cda & tem_bal]
+            df_ambos  = consol[tem_cda & tem_bal]
+
+            with st.expander("🧮 Consolidado por fundo (1 linha por CNPJ)"):
+                st.dataframe(consol, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Baixar (fundos) — Consolidado geral",
+                    data=to_excel_bytes(consol, sheet_name="Consolidado_Fundos"),
+                    file_name=f"{titulo_rel}_fundos.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.write(f"**Somente CDA** ({len(df_so_cda)} fundos)")
+                st.dataframe(df_so_cda, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Baixar — Somente CDA",
+                    data=to_excel_bytes(df_so_cda, sheet_name="Somente_CDA"),
+                    file_name=f"{titulo_rel}_somente_CDA.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with col_b:
+                st.write(f"**Somente Balancete** ({len(df_so_bal)} fundos)")
+                st.dataframe(df_so_bal, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Baixar — Somente Balancete",
+                    data=to_excel_bytes(df_so_bal, sheet_name="Somente_Balancete"),
+                    file_name=f"{titulo_rel}_somente_Balancete.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with col_c:
+                st.write(f"**Ambos** ({len(df_ambos)} fundos)")
+                st.dataframe(df_ambos, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Baixar — Ambos",
+                    data=to_excel_bytes(df_ambos, sheet_name="Ambos"),
+                    file_name=f"{titulo_rel}_ambos.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
